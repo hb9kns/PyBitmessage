@@ -3311,9 +3311,9 @@ more work your computer must do to send the message. A Time-To-Live of four or f
                         'view the full message in the quote.')
             # If we have received this message from either a broadcast address
             # or from someone in our address book, display as HTML
-            if decodeAddress(fromAddress)[3] in shared.broadcastSendersForWhichImWatching or shared.isAddressInMyAddressBook(fromAddress):
-                self.ui.textEditInboxMessage.setText(messageText)
-            else:
+            # if decodeAddress(fromAddress)[3] in shared.broadcastSendersForWhichImWatching or shared.isAddressInMyAddressBook(fromAddress):
+                # self.ui.textEditInboxMessage.setText(messageText)
+            # else:
                 self.ui.textEditInboxMessage.setPlainText(messageText)
 
             self.ui.tableWidgetInbox.item(currentRow, 0).setFont(font)
