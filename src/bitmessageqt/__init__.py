@@ -3314,7 +3314,7 @@ more work your computer must do to send the message. A Time-To-Live of four or f
             # if decodeAddress(fromAddress)[3] in shared.broadcastSendersForWhichImWatching or shared.isAddressInMyAddressBook(fromAddress):
                 # self.ui.textEditInboxMessage.setText(messageText)
             # else:
-                self.ui.textEditInboxMessage.setPlainText(messageText)
+            self.ui.textEditInboxMessage.setPlainText(messageText)
 
             self.ui.tableWidgetInbox.item(currentRow, 0).setFont(font)
             self.ui.tableWidgetInbox.item(currentRow, 1).setFont(font)
