@@ -24,6 +24,8 @@ class MessageView(QtGui.QTextBrowser):
         self.rendering = False
         self.defaultFontPointSize = self.currentFont().pointSize()
         self.verticalScrollBar().valueChanged.connect(self.lazyRender)
+	self.setLineWrapMode(QtGui.QTextEdit.NoWrap)
+	self.setWordWrapMode(QtGui.QTextOption.NoWrap)
     
     def mousePressEvent(self, event):
         #text = textCursor.block().text()
