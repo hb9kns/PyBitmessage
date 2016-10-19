@@ -3755,30 +3755,27 @@ class MyForm(settingsmixin.SMainWindow):
         if currentRow >= 0:
             ackData = str(self.ui.tableWidgetInbox.item(
                 currentRow, 3).data(Qt.UserRole).toPyObject())
-### YCB #            queryreturn = sqlQuery(
-### YCB #                '''select message from inbox where msgid=?''', msgid)
-### YCB #            if queryreturn != []:
-### YCB #                for row in queryreturn:
-### YCB #                    messageText, = row
-### YCB #            messageText = shared.fixPotentiallyInvalidUTF8Data(messageText)
-### YCB #            messageText = unicode(messageText, 'utf-8)')
-### YCB #            if len(messageText) > 30000:
-### YCB #                messageText = (
-### YCB #                        messageText[:30000] + '\n' +
-### YCB #                        '--- Display of the remainder of the message ' +
-### YCB #                        'truncated because it is too long.\n' +
-### YCB #                        '--- To see the full message, right-click in the ' +
-### YCB #                        'Inbox view and select "View HTML code as formatted ' +
-### YCB #                        'text",\n' +
-### YCB #                        '--- or select "Save message as..." to save it to a ' +
-### YCB #                        'file, or select "Reply" and ' +
-### YCB #                        'view the full message in the quote.')
-### YCB #            # If we have received this message from either a broadcast address
-### YCB #            # or from someone in our address book, display as HTML
-### YCB #            # if decodeAddress(fromAddress)[3] in shared.broadcastSendersForWhichImWatching or shared.isAddressInMyAddressBook(fromAddress):
-### YCB #                # self.ui.textEditInboxMessage.setText(messageText)
-### YCB #            # else:
-### YCB #            self.ui.textEditInboxMessage.setPlainText(messageText)
+            queryreturn = sqlQuery(
+                '''select message from inbox where msgid=?''', msgid)
+            if queryreturn != []:
+                for row in queryreturn:
+                    messageText, = row
+            print(':: msgid='+msgid)
+            print(':: len(messageText)='+len(messageText))
+            if len(messageText) > 9999:
+                messageText = (
+                        messageText[:9999] + '\n' +
+                        '*Display of the remainder of the message ' +
+                        'truncated because it is too long.*\n' )
+            messageText = shared.fixPotentiallyInvalidUTF8Data(messageText)
+            messageText = unicode(messageText, 'utf-8)')
+            print(':: len(messageText)='+len(messageText))
+            # If we have received this message from either a broadcast address
+            # or from someone in our address book, display as HTML
+            # if decodeAddress(fromAddress)[3] in shared.broadcastSendersForWhichImWatching or shared.isAddressInMyAddressBook(fromAddress):
+                # self.ui.textEditInboxMessage.setText(messageText)
+            # else:
+            self.ui.textEditInboxMessage.setPlainText(messageText)
             queryreturn = sqlQuery('''SELECT status FROM sent where ackdata=?''', ackData)
             for row in queryreturn:
                 status, = row
