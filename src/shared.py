@@ -15,11 +15,11 @@ useVeryEasyProofOfWorkForTesting = False  # If you set this to True while on the
 # Libraries.
 import base64
 import collections
-import ConfigParser
 import os
 import pickle
 import Queue
 import random
+from multiprocessing import active_children, Queue as mpQueue, Lock as mpLock
 import socket
 import sys
 import stat
@@ -35,6 +35,7 @@ from binascii import hexlify
 # Project imports.
 from addresses import *
 from class_objectProcessorQueue import ObjectProcessorQueue
+from configparser import BMConfigParser
 import highlevelcrypto
 import shared
 #import helper_startup
@@ -42,7 +43,7 @@ from helper_sql import *
 from helper_threading import *
 
 
-config = ConfigParser.SafeConfigParser()
+config = BMConfigParser()
 myECCryptorObjects = {}
 MyECSubscriptionCryptorObjects = {}
 myAddressesByHash = {} #The key in this dictionary is the RIPE hash which is encoded in an address and value is the address itself.
@@ -50,6 +51,10 @@ myAddressesByTag = {} # The key in this dictionary is the tag generated from the
 broadcastSendersForWhichImWatching = {}
 workerQueue = Queue.Queue()
 UISignalQueue = Queue.Queue()
+parserInputQueue = mpQueue()
+parserOutputQueue = mpQueue()
+parserProcess = None
+parserLock = mpLock()
 addressGeneratorQueue = Queue.Queue()
 knownNodesLock = threading.Lock()
 knownNodes = {}
@@ -93,6 +98,7 @@ needToWriteKnownNodesToDisk = False # If True, the singleCleaner will write it t
 maximumLengthOfTimeToBotherResendingMessages = 0
 objectProcessorQueue = ObjectProcessorQueue()  # receiveDataThreads dump objects they hear on the network into this queue to be processed.
 streamsInWhichIAmParticipating = {}
+timeOffsetWrongCount = 0
 
 # sanity check, prevent doing ridiculous PoW
 # 20 million PoWs equals approximately 2 days on dev's dual R9 290
@@ -506,6 +512,10 @@ def isProofOfWorkSufficient(data,
 def doCleanShutdown():
     global shutdown, thisapp
     shutdown = 1 #Used to tell proof of work worker threads and the objectProcessorThread to exit.
+    try:
+        parserInputQueue.put(None, False)
+    except Queue.Full:
+        pass
     broadcastToSendDataQueues((0, 'shutdown', 'no data'))   
     objectProcessorQueue.put(('checkShutdownVariable', 'no data'))
     for thread in threading.enumerate():

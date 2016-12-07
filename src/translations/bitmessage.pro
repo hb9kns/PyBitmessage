@@ -13,6 +13,7 @@ SOURCES	= 	../addresses.py\
 			../helper_bootstrap.py\
 			../helper_generic.py\
 			../helper_inbox.py\
+			../helper_msgcoding.py\
 			../helper_sent.py\
 			../helper_startup.py\
 			../shared.py\
@@ -42,7 +43,8 @@ SOURCES	= 	../addresses.py\
 
 FORMS = \
     ../bitmessageqt/blacklist.ui\
-    ../bitmessageqt/networkstatus.ui
+    ../bitmessageqt/networkstatus.ui\
+    ../bitmessageqt/newchandialog.ui
 
 TRANSLATIONS = \
     bitmessage_ar.ts \
@@ -64,3 +66,4 @@ TRANSLATIONS = \
     bitmessage_zh_cn.ts
 
 CODECFORTR      = UTF-8
+CODECFORSRC     = UTF-8
