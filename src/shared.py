@@ -1,5 +1,9 @@
 ﻿from __future__ import division
 
+print('###############')
+print('### OSX10.7 ###')
+print('###############')
+
 softwareVersion = '0.6.1'
 verbose = 1
 maximumAgeOfAnObjectThatIAmWillingToAccept = 216000  # This is obsolete with the change to protocol v3 but the singleCleaner thread still hasn't been updated so we need this a little longer.
