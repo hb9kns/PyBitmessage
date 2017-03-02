@@ -5,7 +5,9 @@ import hashlib
 import random
 import os
 
-from shared import codePath, safeConfigGetBoolean, safeConfigGet, shutdown
+from bmconfigparser import BMConfigParser
+import paths
+from state import shutdown
 from debug import logger
 
 libAvailable = True
@@ -24,13 +26,17 @@ except:
     libAvailable = False
 
 def initCL():
-    global ctx, queue, program, gpus, enabledGpus, hash_dt, vendors
+    global ctx, queue, program, hash_dt
+    del enabledGpus[:]
+    del vendors[:]
+    del gpus[:]
+    ctx = False
     try:
         hash_dt = numpy.dtype([('target', numpy.uint64), ('v', numpy.str_, 73)])
         try:
             for platform in cl.get_platforms():
                 gpus.extend(platform.get_devices(device_type=cl.device_type.GPU))
-                if safeConfigGet("bitmessagesettings", "opencl") == platform.vendor:
+                if BMConfigParser().safeGet("bitmessagesettings", "opencl") == platform.vendor:
                     enabledGpus.extend(platform.get_devices(device_type=cl.device_type.GPU))
                 if platform.vendor not in vendors:
                     vendors.append(platform.vendor)
@@ -39,28 +45,24 @@ def initCL():
         if (len(enabledGpus) > 0):
             ctx = cl.Context(devices=enabledGpus)
             queue = cl.CommandQueue(ctx)
-            f = open(os.path.join(codePath(), "bitmsghash", 'bitmsghash.cl'), 'r')
+            f = open(os.path.join(paths.codePath(), "bitmsghash", 'bitmsghash.cl'), 'r')
             fstr = ''.join(f.readlines())
             program = cl.Program(ctx, fstr).build(options="")
             logger.info("Loaded OpenCL kernel")
         else:
             logger.info("No OpenCL GPUs found")
-            enabledGpus = []
+            del enabledGpus[:]
     except Exception as e:
         logger.error("OpenCL fail: ", exc_info=True)
-        enabledGpus = []
+        del enabledGpus[:]
 
 def openclAvailable():
-    global gpus
     return (len(gpus) > 0)
 
 def openclEnabled():
-    global enabledGpus
     return (len(enabledGpus) > 0)
 
 def do_opencl_pow(hash, target):
-    global ctx, queue, program, enabledGpus, hash_dt
-
     output = numpy.zeros(1, dtype=[('v', numpy.uint64, 1)])
     if (len(enabledGpus) == 0):
         return output[0][0]

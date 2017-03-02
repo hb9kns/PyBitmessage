@@ -7,11 +7,15 @@ import ctypes
 import hashlib
 import highlevelcrypto
 from addresses import *
+from bmconfigparser import BMConfigParser
 from debug import logger
+import defaults
 from helper_threading import *
 from pyelliptic import arithmetic
 import tr
 from binascii import hexlify
+import queues
+import state
 
 class addressGenerator(threading.Thread, StoppableThread):
 
@@ -22,14 +26,14 @@ class addressGenerator(threading.Thread, StoppableThread):
         
     def stopThread(self):
         try:
-            shared.addressGeneratorQueue.put(("stopThread", "data"))
+            queues.addressGeneratorQueue.put(("stopThread", "data"))
         except:
             pass
         super(addressGenerator, self).stopThread()
 
     def run(self):
-        while shared.shutdown == 0:
-            queueValue = shared.addressGeneratorQueue.get()
+        while state.shutdown == 0:
+            queueValue = queues.addressGeneratorQueue.get()
             nonceTrialsPerByte = 0
             payloadLengthExtraBytes = 0
             live = True
@@ -48,7 +52,7 @@ class addressGenerator(threading.Thread, StoppableThread):
             elif len(queueValue) == 7:
                 command, addressVersionNumber, streamNumber, label, numberOfAddressesToMake, deterministicPassphrase, eighteenByteRipe = queueValue
                 try:
-                    numberOfNullBytesDemandedOnFrontOfRipeHash = shared.config.getint(
+                    numberOfNullBytesDemandedOnFrontOfRipeHash = BMConfigParser().getint(
                         'bitmessagesettings', 'numberofnullbytesonaddress')
                 except:
                     if eighteenByteRipe:
@@ -58,7 +62,7 @@ class addressGenerator(threading.Thread, StoppableThread):
             elif len(queueValue) == 9:
                 command, addressVersionNumber, streamNumber, label, numberOfAddressesToMake, deterministicPassphrase, eighteenByteRipe, nonceTrialsPerByte, payloadLengthExtraBytes = queueValue
                 try:
-                    numberOfNullBytesDemandedOnFrontOfRipeHash = shared.config.getint(
+                    numberOfNullBytesDemandedOnFrontOfRipeHash = BMConfigParser().getint(
                         'bitmessagesettings', 'numberofnullbytesonaddress')
                 except:
                     if eighteenByteRipe:
@@ -74,17 +78,17 @@ class addressGenerator(threading.Thread, StoppableThread):
                 sys.stderr.write(
                     'Program error: For some reason the address generator queue has been given a request to create at least one version %s address which it cannot do.\n' % addressVersionNumber)
             if nonceTrialsPerByte == 0:
-                nonceTrialsPerByte = shared.config.getint(
+                nonceTrialsPerByte = BMConfigParser().getint(
                     'bitmessagesettings', 'defaultnoncetrialsperbyte')
-            if nonceTrialsPerByte < shared.networkDefaultProofOfWorkNonceTrialsPerByte:
-                nonceTrialsPerByte = shared.networkDefaultProofOfWorkNonceTrialsPerByte
+            if nonceTrialsPerByte < defaults.networkDefaultProofOfWorkNonceTrialsPerByte:
+                nonceTrialsPerByte = defaults.networkDefaultProofOfWorkNonceTrialsPerByte
             if payloadLengthExtraBytes == 0:
-                payloadLengthExtraBytes = shared.config.getint(
+                payloadLengthExtraBytes = BMConfigParser().getint(
                     'bitmessagesettings', 'defaultpayloadlengthextrabytes')
-            if payloadLengthExtraBytes < shared.networkDefaultPayloadLengthExtraBytes:
-                payloadLengthExtraBytes = shared.networkDefaultPayloadLengthExtraBytes
+            if payloadLengthExtraBytes < defaults.networkDefaultPayloadLengthExtraBytes:
+                payloadLengthExtraBytes = defaults.networkDefaultPayloadLengthExtraBytes
             if command == 'createRandomAddress':
-                shared.UISignalQueue.put((
+                queues.UISignalQueue.put((
                     'updateStatusBar', tr._translate("MainWindow", "Generating one new address")))
                 # This next section is a little bit strange. We're going to generate keys over and over until we
                 # find one that starts with either \x00 or \x00\x00. Then when we pack them into a Bitmessage address,
@@ -128,34 +132,34 @@ class addressGenerator(threading.Thread, StoppableThread):
                 privEncryptionKeyWIF = arithmetic.changebase(
                     privEncryptionKey + checksum, 256, 58)
 
-                shared.config.add_section(address)
-                shared.config.set(address, 'label', label)
-                shared.config.set(address, 'enabled', 'true')
-                shared.config.set(address, 'decoy', 'false')
-                shared.config.set(address, 'noncetrialsperbyte', str(
+                BMConfigParser().add_section(address)
+                BMConfigParser().set(address, 'label', label)
+                BMConfigParser().set(address, 'enabled', 'true')
+                BMConfigParser().set(address, 'decoy', 'false')
+                BMConfigParser().set(address, 'noncetrialsperbyte', str(
                     nonceTrialsPerByte))
-                shared.config.set(address, 'payloadlengthextrabytes', str(
+                BMConfigParser().set(address, 'payloadlengthextrabytes', str(
                     payloadLengthExtraBytes))
-                shared.config.set(
+                BMConfigParser().set(
                     address, 'privSigningKey', privSigningKeyWIF)
-                shared.config.set(
+                BMConfigParser().set(
                     address, 'privEncryptionKey', privEncryptionKeyWIF)
-                shared.writeKeysFile()
+                BMConfigParser().save()
 
                 # The API and the join and create Chan functionality
                 # both need information back from the address generator.
-                shared.apiAddressGeneratorReturnQueue.put(address)
+                queues.apiAddressGeneratorReturnQueue.put(address)
 
-                shared.UISignalQueue.put((
+                queues.UISignalQueue.put((
                     'updateStatusBar', tr._translate("MainWindow", "Done generating address. Doing work necessary to broadcast it...")))
-                shared.UISignalQueue.put(('writeNewAddressToTable', (
+                queues.UISignalQueue.put(('writeNewAddressToTable', (
                     label, address, streamNumber)))
                 shared.reloadMyAddressHashes()
                 if addressVersionNumber == 3:
-                    shared.workerQueue.put((
+                    queues.workerQueue.put((
                         'sendOutOrStoreMyV3Pubkey', ripe.digest()))
                 elif addressVersionNumber == 4:
-                    shared.workerQueue.put((
+                    queues.workerQueue.put((
                         'sendOutOrStoreMyV4Pubkey', address))
 
             elif command == 'createDeterministicAddresses' or command == 'getDeterministicAddress' or command == 'createChan' or command == 'joinChan':
@@ -163,7 +167,7 @@ class addressGenerator(threading.Thread, StoppableThread):
                     sys.stderr.write(
                         'WARNING: You are creating deterministic address(es) using a blank passphrase. Bitmessage will do it but it is rather stupid.')
                 if command == 'createDeterministicAddresses':
-                    shared.UISignalQueue.put((
+                    queues.UISignalQueue.put((
                                 'updateStatusBar', tr._translate("MainWindow","Generating %1 new addresses.").arg(str(numberOfAddressesToMake))))
                 signingKeyNonce = 0
                 encryptionKeyNonce = 1
@@ -233,33 +237,33 @@ class addressGenerator(threading.Thread, StoppableThread):
 
                         
                         try:
-                            shared.config.add_section(address)
+                            BMConfigParser().add_section(address)
                             addressAlreadyExists = False
                         except:
                             addressAlreadyExists = True
                             
                         if addressAlreadyExists:
                             logger.info('%s already exists. Not adding it again.' % address)
-                            shared.UISignalQueue.put((
+                            queues.UISignalQueue.put((
                                 'updateStatusBar', tr._translate("MainWindow","%1 is already in 'Your Identities'. Not adding it again.").arg(address)))
                         else:
                             logger.debug('label: %s' % label)
-                            shared.config.set(address, 'label', label)
-                            shared.config.set(address, 'enabled', 'true')
-                            shared.config.set(address, 'decoy', 'false')
+                            BMConfigParser().set(address, 'label', label)
+                            BMConfigParser().set(address, 'enabled', 'true')
+                            BMConfigParser().set(address, 'decoy', 'false')
                             if command == 'joinChan' or command == 'createChan':
-                                shared.config.set(address, 'chan', 'true')
-                            shared.config.set(address, 'noncetrialsperbyte', str(
+                                BMConfigParser().set(address, 'chan', 'true')
+                            BMConfigParser().set(address, 'noncetrialsperbyte', str(
                                 nonceTrialsPerByte))
-                            shared.config.set(address, 'payloadlengthextrabytes', str(
+                            BMConfigParser().set(address, 'payloadlengthextrabytes', str(
                                 payloadLengthExtraBytes))
-                            shared.config.set(
+                            BMConfigParser().set(
                                 address, 'privSigningKey', privSigningKeyWIF)
-                            shared.config.set(
+                            BMConfigParser().set(
                                 address, 'privEncryptionKey', privEncryptionKeyWIF)
-                            shared.writeKeysFile()
+                            BMConfigParser().save()
 
-                            shared.UISignalQueue.put(('writeNewAddressToTable', (
+                            queues.UISignalQueue.put(('writeNewAddressToTable', (
                                 label, address, str(streamNumber))))
                             listOfNewAddressesToSendOutThroughTheAPI.append(
                                 address)
@@ -270,24 +274,24 @@ class addressGenerator(threading.Thread, StoppableThread):
                                 addressVersionNumber) + encodeVarint(streamNumber) + ripe.digest()).digest()).digest()[32:]
                             shared.myAddressesByTag[tag] = address
                             if addressVersionNumber == 3:
-                                shared.workerQueue.put((
+                                queues.workerQueue.put((
                                     'sendOutOrStoreMyV3Pubkey', ripe.digest())) # If this is a chan address,
                                         # the worker thread won't send out the pubkey over the network.
                             elif addressVersionNumber == 4:
-                                shared.workerQueue.put((
+                                queues.workerQueue.put((
                                     'sendOutOrStoreMyV4Pubkey', address))
-                            shared.UISignalQueue.put((
+                            queues.UISignalQueue.put((
                                 'updateStatusBar', tr._translate("MainWindow", "Done generating address")))
-                    elif saveAddressToDisk and not live and not shared.config.has_section(address):
+                    elif saveAddressToDisk and not live and not BMConfigParser().has_section(address):
                         listOfNewAddressesToSendOutThroughTheAPI.append(address)
 
                 # Done generating addresses.
                 if command == 'createDeterministicAddresses' or command == 'joinChan' or command == 'createChan':
-                    shared.apiAddressGeneratorReturnQueue.put(
+                    queues.apiAddressGeneratorReturnQueue.put(
                         listOfNewAddressesToSendOutThroughTheAPI)
                 elif command == 'getDeterministicAddress':
-                    shared.apiAddressGeneratorReturnQueue.put(address)
+                    queues.apiAddressGeneratorReturnQueue.put(address)
             else:
                 raise Exception(
                     "Error in the addressGenerator thread. Thread was given a command it could not understand: " + command)
-            shared.addressGeneratorQueue.task_done()
+            queues.addressGeneratorQueue.task_done()

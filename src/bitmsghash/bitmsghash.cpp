@@ -66,7 +66,11 @@ void * threadfunc(void* param) {
 			successval = tmpnonce;
 		}
 	}
+#ifdef _WIN32
+	return 0;
+#else
 	return NULL;
+#endif
 }
 
 void getnumthreads()
@@ -75,6 +79,10 @@ void getnumthreads()
 	DWORD_PTR dwProcessAffinity, dwSystemAffinity;
 #elif __linux__
 	cpu_set_t dwProcessAffinity;
+#elif __OpenBSD__
+	int mib[2], core_count = 0;
+	int dwProcessAffinity = 0;
+	size_t len2;
 #else
 	int dwProcessAffinity = 0;
 	int32_t core_count = 0;
@@ -86,6 +94,12 @@ void getnumthreads()
 	GetProcessAffinityMask(GetCurrentProcess(), &dwProcessAffinity, &dwSystemAffinity);
 #elif __linux__
 	sched_getaffinity(0, len, &dwProcessAffinity);
+#elif __OpenBSD__
+	len2 = sizeof(core_count);
+	mib[0] = CTL_HW;
+	mib[1] = HW_NCPU;
+	if (sysctl(mib, 2, &core_count, &len2, 0, 0) == 0)
+		numthreads = core_count;
 #else
 	if (sysctlbyname("hw.logicalcpu", &core_count, &len, 0, 0) == 0)
 		numthreads = core_count;
@@ -94,7 +108,11 @@ void getnumthreads()
 #endif
 	for (unsigned int i = 0; i < len * 8; i++)
 #if defined(_WIN32)
+#if defined(_MSC_VER)
 		if (dwProcessAffinity & (1i64 << i))
+#else // CYGWIN/MINGW
+		if (dwProcessAffinity & (1ULL << i))
+#endif
 #elif defined __linux__
 		if (CPU_ISSET(i, &dwProcessAffinity))
 #else

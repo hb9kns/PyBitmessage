@@ -19,6 +19,7 @@ try:
 except Exception as err:
     logmsg = 'PyBitmessage requires PyQt unless you want to run it as a daemon and interact with it using the API. You can download it from http://www.riverbankcomputing.com/software/pyqt/download or by searching Google for \'PyQt Download\' (without quotes).'
     logger.critical(logmsg, exc_info=True)
+    import sys
     sys.exit()
 
 try:
@@ -29,6 +30,8 @@ except AttributeError:
 from addresses import *
 import shared
 from bitmessageui import *
+from bmconfigparser import BMConfigParser
+import defaults
 from namecoin import namecoinConnection, ensureNamecoinOptions
 from newaddressdialog import *
 from newaddresswizard import *
@@ -48,14 +51,13 @@ from about import *
 from help import *
 from iconglossary import *
 from connect import *
-import locale as pythonlocale
+import locale
 import sys
 from time import strftime, localtime, gmtime
 import time
 import os
 import hashlib
 from pyelliptic.openssl import OpenSSL
-import pickle
 import platform
 import textwrap
 import debug
@@ -71,11 +73,20 @@ import types
 from utils import *
 from collections import OrderedDict
 from account import *
-from dialogs import AddAddressDialog
 from class_objectHashHolder import objectHashHolder
 from class_singleWorker import singleWorker
-from helper_generic import powQueueSize, invQueueSize
+from dialogs import AddAddressDialog
+from helper_generic import powQueueSize
+from inventory import PendingDownload, PendingUpload, PendingUploadDeadlineException
+import knownnodes
+import paths
 from proofofwork import getPowType
+import queues
+import shutdown
+import state
+from statusbar import BMStatusBar
+import throttle
+from version import softwareVersion
 
 def _translate(context, text, disambiguation = None, encoding = None, number = None):
     if number is None:
@@ -83,7 +94,7 @@ def _translate(context, text, disambiguation = None, encoding = None, number = N
     else:
         return QtGui.QApplication.translate(context, text, None, QtCore.QCoreApplication.CodecForTr, number)
 
-def change_translation(locale):
+def change_translation(newlocale):
     global qmytranslator, qsystranslator
     try:
         if not qmytranslator.isEmpty():
@@ -97,29 +108,29 @@ def change_translation(locale):
         pass
 
     qmytranslator = QtCore.QTranslator()
-    translationpath = os.path.join (shared.codePath(), 'translations', 'bitmessage_' + locale)
+    translationpath = os.path.join (paths.codePath(), 'translations', 'bitmessage_' + newlocale)
     qmytranslator.load(translationpath)
     QtGui.QApplication.installTranslator(qmytranslator)
 
     qsystranslator = QtCore.QTranslator()
-    if shared.frozen:
-        translationpath = os.path.join (shared.codePath(), 'translations', 'qt_' + locale)
+    if paths.frozen:
+        translationpath = os.path.join (paths.codePath(), 'translations', 'qt_' + newlocale)
     else:
-        translationpath = os.path.join (str(QtCore.QLibraryInfo.location(QtCore.QLibraryInfo.TranslationsPath)), 'qt_' + locale)
+        translationpath = os.path.join (str(QtCore.QLibraryInfo.location(QtCore.QLibraryInfo.TranslationsPath)), 'qt_' + newlocale)
     qsystranslator.load(translationpath)
     QtGui.QApplication.installTranslator(qsystranslator)
 
-    lang = pythonlocale.normalize(l10n.getTranslationLanguage())
+    lang = locale.normalize(l10n.getTranslationLanguage())
     langs = [lang.split(".")[0] + "." + l10n.encoding, lang.split(".")[0] + "." + 'UTF-8', lang]
     if 'win32' in sys.platform or 'win64' in sys.platform:
         langs = [l10n.getWindowsLocale(lang)]
     for lang in langs:
         try:
-            pythonlocale.setlocale(pythonlocale.LC_ALL, lang)
+            l10n.setlocale(locale.LC_ALL, lang)
             if 'win32' not in sys.platform and 'win64' not in sys.platform:
-                l10n.encoding = pythonlocale.nl_langinfo(pythonlocale.CODESET)
+                l10n.encoding = locale.nl_langinfo(locale.CODESET)
             else:
-                l10n.encoding = pythonlocale.getlocale()[1]
+                l10n.encoding = locale.getlocale()[1]
             logger.info("Successfully set locale to %s", lang)
             break
         except:
@@ -489,11 +500,11 @@ class MyForm(settingsmixin.SMainWindow):
         enabled = {}
         
         for toAddress in getSortedAccounts():
-            isEnabled = shared.config.getboolean(
+            isEnabled = BMConfigParser().getboolean(
                 toAddress, 'enabled')
-            isChan = shared.safeConfigGetBoolean(
+            isChan = BMConfigParser().safeGetBoolean(
                 toAddress, 'chan')
-            isMaillinglist = shared.safeConfigGetBoolean(
+            isMaillinglist = BMConfigParser().safeGetBoolean(
                 toAddress, 'mailinglist')
 
             if treeWidget == self.ui.treeWidgetYourIdentities:
@@ -560,6 +571,8 @@ class MyForm(settingsmixin.SMainWindow):
             if len(db[toAddress]) > 0:
                 j = 0
                 for f, c in db[toAddress].iteritems():
+                    if toAddress is not None and tab == 'messages' and folder == "new":
+                        continue
                     subwidget = Ui_FolderWidget(widget, j, toAddress, f, c)
                     if subwidget.folderName not in ["new", "trash", "sent"]:
                         unread += c
@@ -574,7 +587,7 @@ class MyForm(settingsmixin.SMainWindow):
             j = 0
             unread = 0
             for folder in folders:
-                if toAddress is not None and folder == "new":
+                if toAddress is not None and tab == 'messages' and folder == "new":
                     continue
                 subwidget = Ui_FolderWidget(widget, j, toAddress, folder, db[toAddress][folder])
                 if subwidget.folderName not in ["new", "trash", "sent"]:
@@ -602,8 +615,8 @@ class MyForm(settingsmixin.SMainWindow):
                 reply = QtGui.QMessageBox.question(
                     self, 'Message', displayMsg, QtGui.QMessageBox.Yes, QtGui.QMessageBox.No)
                 if reply == QtGui.QMessageBox.Yes:
-                    shared.config.remove_section(addressInKeysFile)
-                    shared.writeKeysFile()
+                    BMConfigParser().remove_section(addressInKeysFile)
+                    BMConfigParser().save()
 
         # Configure Bitmessage to start on startup (or remove the
         # configuration) based on the setting in the keys.dat file
@@ -613,7 +626,7 @@ class MyForm(settingsmixin.SMainWindow):
             self.settings = QSettings(RUN_PATH, QSettings.NativeFormat)
             self.settings.remove(
                 "PyBitmessage")  # In case the user moves the program and the registry entry is no longer valid, this will delete the old registry entry.
-            if shared.config.getboolean('bitmessagesettings', 'startonlogon'):
+            if BMConfigParser().getboolean('bitmessagesettings', 'startonlogon'):
                 self.settings.setValue("PyBitmessage", sys.argv[0])
         elif 'darwin' in sys.platform:
             # startup for mac
@@ -627,6 +640,9 @@ class MyForm(settingsmixin.SMainWindow):
         
         # switch back to this when replying
         self.replyFromTab = None
+
+        # so that quit won't loop
+        self.quitAccepted = False
         
         self.init_file_menu()
         self.init_inbox_popup_menu()
@@ -703,6 +719,7 @@ class MyForm(settingsmixin.SMainWindow):
 
         # Put the colored icon on the status bar
         # self.pushButtonStatusIcon.setIcon(QIcon(":/newPrefix/images/yellowicon.png"))
+        self.setStatusBar(BMStatusBar())
         self.statusbar = self.statusBar()
 
         self.pushButtonStatusIcon = QtGui.QPushButton(self)
@@ -781,7 +798,7 @@ class MyForm(settingsmixin.SMainWindow):
         self.rerenderComboBoxSendFromBroadcast()
         
         # Put the TTL slider in the correct spot
-        TTL = shared.config.getint('bitmessagesettings', 'ttl')
+        TTL = BMConfigParser().getint('bitmessagesettings', 'ttl')
         if TTL < 3600: # an hour
             TTL = 3600
         elif TTL > 28*24*60*60: # 28 days
@@ -797,11 +814,11 @@ class MyForm(settingsmixin.SMainWindow):
         # Check to see whether we can connect to namecoin. Hide the 'Fetch Namecoin ID' button if we can't.
         try:
             options = {}
-            options["type"] = shared.config.get('bitmessagesettings', 'namecoinrpctype')
-            options["host"] = shared.config.get('bitmessagesettings', 'namecoinrpchost')
-            options["port"] = shared.config.get('bitmessagesettings', 'namecoinrpcport')
-            options["user"] = shared.config.get('bitmessagesettings', 'namecoinrpcuser')
-            options["password"] = shared.config.get('bitmessagesettings', 'namecoinrpcpassword')
+            options["type"] = BMConfigParser().get('bitmessagesettings', 'namecoinrpctype')
+            options["host"] = BMConfigParser().get('bitmessagesettings', 'namecoinrpchost')
+            options["port"] = BMConfigParser().get('bitmessagesettings', 'namecoinrpcport')
+            options["user"] = BMConfigParser().get('bitmessagesettings', 'namecoinrpcuser')
+            options["password"] = BMConfigParser().get('bitmessagesettings', 'namecoinrpcpassword')
             nc = namecoinConnection(options)
             if nc.test()[0] == 'failed':
                 self.ui.pushButtonFetchNamecoinID.hide()
@@ -812,16 +829,28 @@ class MyForm(settingsmixin.SMainWindow):
     def updateTTL(self, sliderPosition):
         TTL = int(sliderPosition ** 3.199 + 3600)
         self.updateHumanFriendlyTTLDescription(TTL)
-        shared.config.set('bitmessagesettings', 'ttl', str(TTL))
-        shared.writeKeysFile()
+        BMConfigParser().set('bitmessagesettings', 'ttl', str(TTL))
+        BMConfigParser().save()
         
     def updateHumanFriendlyTTLDescription(self, TTL):
         numberOfHours = int(round(TTL / (60*60)))
+        font = QtGui.QFont()
+        stylesheet = ""
+
         if numberOfHours < 48:
-            self.ui.labelHumanFriendlyTTLDescription.setText(_translate("MainWindow", "%n hour(s)", None, QtCore.QCoreApplication.CodecForTr, numberOfHours))
+            self.ui.labelHumanFriendlyTTLDescription.setText(
+                _translate("MainWindow", "%n hour(s)", None, QtCore.QCoreApplication.CodecForTr, numberOfHours) +
+                ", " +
+                _translate("MainWindow", "not recommended for chans", None, QtCore.QCoreApplication.CodecForTr)
+                )
+            stylesheet = "QLabel { color : red; }"
+            font.setBold(True)
         else:
             numberOfDays = int(round(TTL / (24*60*60)))
             self.ui.labelHumanFriendlyTTLDescription.setText(_translate("MainWindow", "%n day(s)", None, QtCore.QCoreApplication.CodecForTr, numberOfDays))
+            font.setBold(False)
+        self.ui.labelHumanFriendlyTTLDescription.setStyleSheet(stylesheet)
+        self.ui.labelHumanFriendlyTTLDescription.setFont(font)
 
     # Show or hide the application window after clicking an item within the
     # tray icon or, on Windows, the try icon itself.
@@ -1100,8 +1129,8 @@ class MyForm(settingsmixin.SMainWindow):
             toAddress, fromAddress, subject, status, ackdata, lastactiontime = row
             self.addMessageListItemSent(tableWidget, toAddress, fromAddress, subject, status, ackdata, lastactiontime)
 
-        tableWidget.setSortingEnabled(False)
         tableWidget.horizontalHeader().setSortIndicator(3, Qt.DescendingOrder)
+        tableWidget.setSortingEnabled(True)
         tableWidget.horizontalHeaderItem(3).setText(_translate("MainWindow", "Sent", None))
         tableWidget.setUpdatesEnabled(True)
 
@@ -1159,7 +1188,7 @@ class MyForm(settingsmixin.SMainWindow):
         # show bitmessage
         self.actionShow = QtGui.QAction(_translate(
             "MainWindow", "Show Bitmessage"), m, checkable=True)
-        self.actionShow.setChecked(not shared.config.getboolean(
+        self.actionShow.setChecked(not BMConfigParser().getboolean(
             'bitmessagesettings', 'startintray'))
         self.actionShow.triggered.connect(self.appIndicatorShowOrHideWindow)
         if not sys.platform[0:3] == 'win':
@@ -1207,8 +1236,6 @@ class MyForm(settingsmixin.SMainWindow):
 
     # When an unread inbox row is selected on then clear the messaging menu
     def ubuntuMessagingMenuClear(self, inventoryHash):
-        global withMessagingMenu
-
         # if this isn't ubuntu then don't do anything
         if not self.isUbuntu():
             return
@@ -1248,7 +1275,7 @@ class MyForm(settingsmixin.SMainWindow):
                 if toAddress == str_broadcast_subscribers:
                     toLabel = str_broadcast_subscribers
                 else:
-                    toLabel = shared.config.get(toAddress, 'label')
+                    toLabel = BMConfigParser().get(toAddress, 'label')
             except:
                 toLabel = ''
             if toLabel == '':
@@ -1308,8 +1335,6 @@ class MyForm(settingsmixin.SMainWindow):
 
     # update the Ubuntu messaging menu
     def ubuntuMessagingMenuUpdate(self, drawAttention, newItem, toLabel):
-        global withMessagingMenu
-
         # if this isn't ubuntu then don't do anything
         if not self.isUbuntu():
             return
@@ -1356,9 +1381,9 @@ class MyForm(settingsmixin.SMainWindow):
         # if the address had a known label in the address book
         if label is not None:
             # Does a sound file exist for this particular contact?
-            if (os.path.isfile(shared.appdata + 'sounds/' + label + '.wav') or
-                os.path.isfile(shared.appdata + 'sounds/' + label + '.mp3')):
-                soundFilename = shared.appdata + 'sounds/' + label
+            if (os.path.isfile(state.appdata + 'sounds/' + label + '.wav') or
+                os.path.isfile(state.appdata + 'sounds/' + label + '.mp3')):
+                soundFilename = state.appdata + 'sounds/' + label
 
         # Avoid making sounds more frequently than the threshold.
         # This suppresses playing sounds repeatedly when there
@@ -1374,19 +1399,19 @@ class MyForm(settingsmixin.SMainWindow):
         if soundFilename is None:
             # the sound is for an address which exists in the address book
             if category is self.SOUND_KNOWN:
-                soundFilename = shared.appdata + 'sounds/known'
+                soundFilename = state.appdata + 'sounds/known'
             # the sound is for an unknown address
             elif category is self.SOUND_UNKNOWN:
-                soundFilename = shared.appdata + 'sounds/unknown'
+                soundFilename = state.appdata + 'sounds/unknown'
             # initial connection sound
             elif category is self.SOUND_CONNECTED:
-                soundFilename = shared.appdata + 'sounds/connected'
+                soundFilename = state.appdata + 'sounds/connected'
             # disconnected sound
             elif category is self.SOUND_DISCONNECTED:
-                soundFilename = shared.appdata + 'sounds/disconnected'
+                soundFilename = state.appdata + 'sounds/disconnected'
             # sound when the connection status becomes green
             elif category is self.SOUND_CONNECTION_GREEN:
-                soundFilename = shared.appdata + 'sounds/green'            
+                soundFilename = state.appdata + 'sounds/green'            
 
         if soundFilename is not None and play is True:
             if not self.isConnectionSound(category):
@@ -1433,14 +1458,11 @@ class MyForm(settingsmixin.SMainWindow):
 
     # initialise the message notifier
     def notifierInit(self):
-        global withMessagingMenu
         if withMessagingMenu:
             Notify.init('pybitmessage')
 
     # shows a notification
     def notifierShow(self, title, subtitle, fromCategory, label):
-        global withMessagingMenu
-
         self.playSound(fromCategory, label)
 
         if withMessagingMenu:
@@ -1522,7 +1544,7 @@ class MyForm(settingsmixin.SMainWindow):
     # menu button 'manage keys'
     def click_actionManageKeys(self):
         if 'darwin' in sys.platform or 'linux' in sys.platform:
-            if shared.appdata == '':
+            if state.appdata == '':
                 # reply = QtGui.QMessageBox.information(self, 'keys.dat?','You
                 # may manage your keys by editing the keys.dat file stored in
                 # the same directory as this program. It is important that you
@@ -1532,14 +1554,14 @@ class MyForm(settingsmixin.SMainWindow):
 
             else:
                 QtGui.QMessageBox.information(self, 'keys.dat?', _translate(
-                    "MainWindow", "You may manage your keys by editing the keys.dat file stored in\n %1 \nIt is important that you back up this file.").arg(shared.appdata), QMessageBox.Ok)
+                    "MainWindow", "You may manage your keys by editing the keys.dat file stored in\n %1 \nIt is important that you back up this file.").arg(state.appdata), QMessageBox.Ok)
         elif sys.platform == 'win32' or sys.platform == 'win64':
-            if shared.appdata == '':
+            if state.appdata == '':
                 reply = QtGui.QMessageBox.question(self, _translate("MainWindow", "Open keys.dat?"), _translate(
                     "MainWindow", "You may manage your keys by editing the keys.dat file stored in the same directory as this program. It is important that you back up this file. Would you like to open the file now? (Be sure to close Bitmessage before making any changes.)"), QtGui.QMessageBox.Yes, QtGui.QMessageBox.No)
             else:
                 reply = QtGui.QMessageBox.question(self, _translate("MainWindow", "Open keys.dat?"), _translate(
-                    "MainWindow", "You may manage your keys by editing the keys.dat file stored in\n %1 \nIt is important that you back up this file. Would you like to open the file now? (Be sure to close Bitmessage before making any changes.)").arg(shared.appdata), QtGui.QMessageBox.Yes, QtGui.QMessageBox.No)
+                    "MainWindow", "You may manage your keys by editing the keys.dat file stored in\n %1 \nIt is important that you back up this file. Would you like to open the file now? (Be sure to close Bitmessage before making any changes.)").arg(state.appdata), QtGui.QMessageBox.Yes, QtGui.QMessageBox.No)
             if reply == QtGui.QMessageBox.Yes:
                 shared.openKeysFile()
 
@@ -1581,7 +1603,7 @@ class MyForm(settingsmixin.SMainWindow):
                 QMessageBox.about(self, _translate("MainWindow", "Bad address version number"), _translate(
                     "MainWindow", "Your address version number must be either 3 or 4."))
                 return
-            shared.addressGeneratorQueue.put(('createDeterministicAddresses', addressVersionNumber, streamNumberForAddress, "regenerated deterministic address", self.regenerateAddressesDialogInstance.ui.spinBoxNumberOfAddressesToMake.value(
+            queues.addressGeneratorQueue.put(('createDeterministicAddresses', addressVersionNumber, streamNumberForAddress, "regenerated deterministic address", self.regenerateAddressesDialogInstance.ui.spinBoxNumberOfAddressesToMake.value(
             ), self.regenerateAddressesDialogInstance.ui.lineEditPassphrase.text().toUtf8(), self.regenerateAddressesDialogInstance.ui.checkBoxEighteenByteRipe.isChecked()))
             self.ui.tabWidget.setCurrentIndex(3)
 
@@ -1593,8 +1615,8 @@ class MyForm(settingsmixin.SMainWindow):
         self.connectDialogInstance = connectDialog(self)
         if self.connectDialogInstance.exec_():
             if self.connectDialogInstance.ui.radioButtonConnectNow.isChecked():
-                shared.config.remove_option('bitmessagesettings', 'dontconnect')
-                shared.writeKeysFile()
+                BMConfigParser().remove_option('bitmessagesettings', 'dontconnect')
+                BMConfigParser().save()
             else:
                 self.click_actionSettings()
 
@@ -1617,7 +1639,7 @@ class MyForm(settingsmixin.SMainWindow):
             self.ui.blackwhitelist.init_blacklist_popup_menu(False)
         if event.type() == QtCore.QEvent.WindowStateChange:
             if self.windowState() & QtCore.Qt.WindowMinimized:
-                if shared.config.getboolean('bitmessagesettings', 'minimizetotray') and not 'darwin' in sys.platform:
+                if BMConfigParser().getboolean('bitmessagesettings', 'minimizetotray') and not 'darwin' in sys.platform:
                     QTimer.singleShot(0, self.appIndicatorHide)
             elif event.oldState() & QtCore.Qt.WindowMinimized:
                 # The window state has just been changed to
@@ -1635,17 +1657,20 @@ class MyForm(settingsmixin.SMainWindow):
     connected = False
 
     def setStatusIcon(self, color):
-        global withMessagingMenu
         # print 'setting status icon color'
         if color == 'red':
             self.pushButtonStatusIcon.setIcon(
                 QIcon(":/newPrefix/images/redicon.png"))
             shared.statusIconColor = 'red'
             # if the connection is lost then show a notification
-            if self.connected and not shared.config.getboolean('bitmessagesettings', 'hidetrayconnectionnotifications'):
+            if self.connected and not BMConfigParser().getboolean('bitmessagesettings', 'hidetrayconnectionnotifications'):
                 self.notifierShow('Bitmessage', unicode(_translate(
                             "MainWindow", "Connection lost").toUtf8(),'utf-8'),
                                   self.SOUND_DISCONNECTED, None)
+            if not BMConfigParser().safeGetBoolean('bitmessagesettings', 'upnp') and \
+                BMConfigParser().get('bitmessagesettings', 'socksproxytype') == "none":
+                self.statusBar().showMessage(_translate(
+                    "MainWindow", "Problems connecting? Try enabling UPnP in the Network Settings"), 10000)
             self.connected = False
 
             if self.actionStatus is not None:
@@ -1659,7 +1684,7 @@ class MyForm(settingsmixin.SMainWindow):
                 ":/newPrefix/images/yellowicon.png"))
             shared.statusIconColor = 'yellow'
             # if a new connection has been established then show a notification
-            if not self.connected and not shared.config.getboolean('bitmessagesettings', 'hidetrayconnectionnotifications'):
+            if not self.connected and not BMConfigParser().getboolean('bitmessagesettings', 'hidetrayconnectionnotifications'):
                 self.notifierShow('Bitmessage', unicode(_translate(
                             "MainWindow", "Connected").toUtf8(),'utf-8'),
                                   self.SOUND_CONNECTED, None)
@@ -1675,7 +1700,7 @@ class MyForm(settingsmixin.SMainWindow):
             self.pushButtonStatusIcon.setIcon(
                 QIcon(":/newPrefix/images/greenicon.png"))
             shared.statusIconColor = 'green'
-            if not self.connected and not shared.config.getboolean('bitmessagesettings', 'hidetrayconnectionnotifications'):
+            if not self.connected and not BMConfigParser().getboolean('bitmessagesettings', 'hidetrayconnectionnotifications'):
                 self.notifierShow('Bitmessage', unicode(_translate(
                             "MainWindow", "Connected").toUtf8(),'utf-8'),
                                   self.SOUND_CONNECTION_GREEN, None)
@@ -1854,7 +1879,7 @@ class MyForm(settingsmixin.SMainWindow):
         addresses = getSortedAccounts()
         for address in addresses:
             account = accountClass(address)
-            if (account.type == AccountMixin.CHAN and shared.safeConfigGetBoolean(address, 'enabled')):
+            if (account.type == AccountMixin.CHAN and BMConfigParser().safeGetBoolean(address, 'enabled')):
                 newRows[address] = [account.getLabel(), AccountMixin.CHAN]
         # normal accounts
         queryreturn = sqlQuery('SELECT * FROM addressbook')
@@ -1890,6 +1915,8 @@ class MyForm(settingsmixin.SMainWindow):
  more work your computer must do to send the message. A Time-To-Live of four or five days is often appropriate."""), QMessageBox.Ok)
 
     def click_pushButtonSend(self):
+        encoding = 3 if QtGui.QApplication.queryKeyboardModifiers() & QtCore.Qt.ShiftModifier else 2
+
         self.statusBar().clearMessage()
 
         if self.ui.tabWidgetSend.currentIndex() == 0:
@@ -1948,9 +1975,9 @@ class MyForm(settingsmixin.SMainWindow):
                                 email = ''.join(random.SystemRandom().choice(string.ascii_lowercase) for _ in range(12)) + "@mailchuck.com"
                             acct = MailchuckAccount(fromAddress)
                             acct.register(email)
-                            shared.config.set(fromAddress, 'label', email)
-                            shared.config.set(fromAddress, 'gateway', 'mailchuck')
-                            shared.writeKeysFile()
+                            BMConfigParser().set(fromAddress, 'label', email)
+                            BMConfigParser().set(fromAddress, 'gateway', 'mailchuck')
+                            BMConfigParser().save()
                             self.statusBar().showMessage(_translate(
                                 "MainWindow", "Error: Your account wasn't registered at an email gateway. Sending registration now as %1, please wait for the registration to be processed before retrying sending.").arg(email), 10000)
                             return
@@ -2022,8 +2049,8 @@ class MyForm(settingsmixin.SMainWindow):
                             'msgqueued',
                             0, # retryNumber
                             'sent', # folder
-                            2, # encodingtype
-                            shared.config.getint('bitmessagesettings', 'ttl')
+                            encoding, # encodingtype
+                            BMConfigParser().getint('bitmessagesettings', 'ttl')
                             )
 
                         toLabel = ''
@@ -2035,7 +2062,7 @@ class MyForm(settingsmixin.SMainWindow):
 
                         self.displayNewSentMessage(
                             toAddress, toLabel, fromAddress, subject, message, ackdata)
-                        shared.workerQueue.put(('sendmessage', toAddress))
+                        queues.workerQueue.put(('sendmessage', toAddress))
 
                         self.ui.comboBoxSendFrom.setCurrentIndex(0)
                         self.ui.lineEditTo.setText('')
@@ -2075,8 +2102,8 @@ class MyForm(settingsmixin.SMainWindow):
                      'broadcastqueued', 
                      0, # retryNumber
                      'sent', # folder
-                     2, # encoding type
-                     shared.config.getint('bitmessagesettings', 'ttl')
+                     encoding, # encoding type
+                     BMConfigParser().getint('bitmessagesettings', 'ttl')
                      )
                 sqlExecute(
                     '''INSERT INTO sent VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', *t)
@@ -2086,7 +2113,7 @@ class MyForm(settingsmixin.SMainWindow):
                 self.displayNewSentMessage(
                     toAddress, toLabel, fromAddress, subject, message, ackdata)
 
-                shared.workerQueue.put(('sendbroadcast', ''))
+                queues.workerQueue.put(('sendbroadcast', ''))
 
                 self.ui.comboBoxSendFromBroadcast.setCurrentIndex(0)
                 self.ui.lineEditSubjectBroadcast.setText('')
@@ -2121,7 +2148,7 @@ class MyForm(settingsmixin.SMainWindow):
     def setBroadcastEnablementDependingOnWhetherThisIsAMailingListAddress(self, address):
         # If this is a chan then don't let people broadcast because no one
         # should subscribe to chan addresses.
-        if shared.safeConfigGetBoolean(str(address), 'mailinglist'):
+        if BMConfigParser().safeGetBoolean(str(address), 'mailinglist'):
             self.ui.tabWidgetSend.setCurrentIndex(1)
         else:
             self.ui.tabWidgetSend.setCurrentIndex(0)
@@ -2129,11 +2156,11 @@ class MyForm(settingsmixin.SMainWindow):
     def rerenderComboBoxSendFrom(self):
         self.ui.comboBoxSendFrom.clear()
         for addressInKeysFile in getSortedAccounts():
-            isEnabled = shared.config.getboolean(
+            isEnabled = BMConfigParser().getboolean(
                 addressInKeysFile, 'enabled')  # I realize that this is poor programming practice but I don't care. It's easier for others to read.
-            isMaillinglist = shared.safeConfigGetBoolean(addressInKeysFile, 'mailinglist')
+            isMaillinglist = BMConfigParser().safeGetBoolean(addressInKeysFile, 'mailinglist')
             if isEnabled and not isMaillinglist:
-                label = unicode(shared.config.get(addressInKeysFile, 'label'), 'utf-8', 'ignore').strip()
+                label = unicode(BMConfigParser().get(addressInKeysFile, 'label'), 'utf-8', 'ignore').strip()
                 if label == "":
                     label = addressInKeysFile
                 self.ui.comboBoxSendFrom.addItem(avatarize(addressInKeysFile), label, addressInKeysFile)
@@ -2150,11 +2177,11 @@ class MyForm(settingsmixin.SMainWindow):
     def rerenderComboBoxSendFromBroadcast(self):
         self.ui.comboBoxSendFromBroadcast.clear()
         for addressInKeysFile in getSortedAccounts():
-            isEnabled = shared.config.getboolean(
+            isEnabled = BMConfigParser().getboolean(
                 addressInKeysFile, 'enabled')  # I realize that this is poor programming practice but I don't care. It's easier for others to read.
-            isChan = shared.safeConfigGetBoolean(addressInKeysFile, 'chan')
+            isChan = BMConfigParser().safeGetBoolean(addressInKeysFile, 'chan')
             if isEnabled and not isChan:
-                label = unicode(shared.config.get(addressInKeysFile, 'label'), 'utf-8', 'ignore').strip()
+                label = unicode(BMConfigParser().get(addressInKeysFile, 'label'), 'utf-8', 'ignore').strip()
                 if label == "":
                     label = addressInKeysFile
                 self.ui.comboBoxSendFromBroadcast.addItem(avatarize(addressInKeysFile), label, addressInKeysFile)
@@ -2217,7 +2244,7 @@ class MyForm(settingsmixin.SMainWindow):
         else:
             acct = ret
         self.propagateUnreadCount(acct.address)
-        if shared.config.getboolean('bitmessagesettings', 'showtraynotifications'):
+        if BMConfigParser().getboolean('bitmessagesettings', 'showtraynotifications'):
             self.notifierShow(unicode(_translate("MainWindow",'New Message').toUtf8(),'utf-8'), unicode(_translate("MainWindow",'From ').toUtf8(),'utf-8') + unicode(acct.fromLabel, 'utf-8'), self.SOUND_UNKNOWN, None)
         if self.getCurrentAccount() is not None and ((self.getCurrentFolder(treeWidget) != "inbox" and self.getCurrentFolder(treeWidget) is not None) or self.getCurrentAccount(treeWidget) != acct.address):
             # Ubuntu should notify of new message irespective of whether it's in current message list or not
@@ -2231,9 +2258,9 @@ class MyForm(settingsmixin.SMainWindow):
                     email = str(self.dialog.ui.lineEditEmail.text().toUtf8())
                     # register resets address variables
                     acct.register(email)
-                    shared.config.set(acct.fromAddress, 'label', email)
-                    shared.config.set(acct.fromAddress, 'gateway', 'mailchuck')
-                    shared.writeKeysFile()
+                    BMConfigParser().set(acct.fromAddress, 'label', email)
+                    BMConfigParser().set(acct.fromAddress, 'gateway', 'mailchuck')
+                    BMConfigParser().save()
                     self.statusBar().showMessage(_translate(
                         "MainWindow", "Sending email gateway registration request"), 10000)
 
@@ -2297,7 +2324,7 @@ class MyForm(settingsmixin.SMainWindow):
                     addressVersion) + encodeVarint(streamNumber) + ripe).digest()).digest()
                 tag = doubleHashOfAddressData[32:]
                 for value in shared.inventory.by_type_and_tag(3, tag):
-                    shared.objectProcessorQueue.put((value.type, value.payload))
+                    queues.objectProcessorQueue.put((value.type, value.payload))
 
     def click_pushButtonStatusIcon(self):
         logger.debug('click_pushButtonStatusIcon')
@@ -2319,127 +2346,135 @@ class MyForm(settingsmixin.SMainWindow):
     def click_actionSettings(self):
         self.settingsDialogInstance = settingsDialog(self)
         if self.settingsDialogInstance.exec_():
-            shared.config.set('bitmessagesettings', 'startonlogon', str(
+            BMConfigParser().set('bitmessagesettings', 'startonlogon', str(
                 self.settingsDialogInstance.ui.checkBoxStartOnLogon.isChecked()))
-            shared.config.set('bitmessagesettings', 'minimizetotray', str(
+            BMConfigParser().set('bitmessagesettings', 'minimizetotray', str(
                 self.settingsDialogInstance.ui.checkBoxMinimizeToTray.isChecked()))
-            shared.config.set('bitmessagesettings', 'trayonclose', str(
+            BMConfigParser().set('bitmessagesettings', 'trayonclose', str(
                 self.settingsDialogInstance.ui.checkBoxTrayOnClose.isChecked()))
-            shared.config.set('bitmessagesettings', 'hidetrayconnectionnotifications', str(
+            BMConfigParser().set('bitmessagesettings', 'hidetrayconnectionnotifications', str(
                 self.settingsDialogInstance.ui.checkBoxHideTrayConnectionNotifications.isChecked()))
-            shared.config.set('bitmessagesettings', 'showtraynotifications', str(
+            BMConfigParser().set('bitmessagesettings', 'showtraynotifications', str(
                 self.settingsDialogInstance.ui.checkBoxShowTrayNotifications.isChecked()))
-            shared.config.set('bitmessagesettings', 'startintray', str(
+            BMConfigParser().set('bitmessagesettings', 'startintray', str(
                 self.settingsDialogInstance.ui.checkBoxStartInTray.isChecked()))
-            shared.config.set('bitmessagesettings', 'willinglysendtomobile', str(
+            BMConfigParser().set('bitmessagesettings', 'willinglysendtomobile', str(
                 self.settingsDialogInstance.ui.checkBoxWillinglySendToMobile.isChecked()))
-            shared.config.set('bitmessagesettings', 'useidenticons', str(
+            BMConfigParser().set('bitmessagesettings', 'useidenticons', str(
                 self.settingsDialogInstance.ui.checkBoxUseIdenticons.isChecked()))
-            shared.config.set('bitmessagesettings', 'replybelow', str(
+            BMConfigParser().set('bitmessagesettings', 'replybelow', str(
                 self.settingsDialogInstance.ui.checkBoxReplyBelow.isChecked()))
                 
             lang = str(self.settingsDialogInstance.ui.languageComboBox.itemData(self.settingsDialogInstance.ui.languageComboBox.currentIndex()).toString())
-            shared.config.set('bitmessagesettings', 'userlocale', lang)
+            BMConfigParser().set('bitmessagesettings', 'userlocale', lang)
             change_translation(l10n.getTranslationLanguage())
             
-            if int(shared.config.get('bitmessagesettings', 'port')) != int(self.settingsDialogInstance.ui.lineEditTCPPort.text()):
-                if not shared.safeConfigGetBoolean('bitmessagesettings', 'dontconnect'):
+            if int(BMConfigParser().get('bitmessagesettings', 'port')) != int(self.settingsDialogInstance.ui.lineEditTCPPort.text()):
+                if not BMConfigParser().safeGetBoolean('bitmessagesettings', 'dontconnect'):
                     QMessageBox.about(self, _translate("MainWindow", "Restart"), _translate(
                         "MainWindow", "You must restart Bitmessage for the port number change to take effect."))
-                shared.config.set('bitmessagesettings', 'port', str(
+                BMConfigParser().set('bitmessagesettings', 'port', str(
                     self.settingsDialogInstance.ui.lineEditTCPPort.text()))
-            if self.settingsDialogInstance.ui.checkBoxUPnP.isChecked() != shared.safeConfigGetBoolean('bitmessagesettings', 'upnp'):
-                shared.config.set('bitmessagesettings', 'upnp', str(self.settingsDialogInstance.ui.checkBoxUPnP.isChecked()))
+            if self.settingsDialogInstance.ui.checkBoxUPnP.isChecked() != BMConfigParser().safeGetBoolean('bitmessagesettings', 'upnp'):
+                BMConfigParser().set('bitmessagesettings', 'upnp', str(self.settingsDialogInstance.ui.checkBoxUPnP.isChecked()))
                 if self.settingsDialogInstance.ui.checkBoxUPnP.isChecked():
                     import upnp
                     upnpThread = upnp.uPnPThread()
                     upnpThread.start()
             #print 'self.settingsDialogInstance.ui.comboBoxProxyType.currentText()', self.settingsDialogInstance.ui.comboBoxProxyType.currentText()
             #print 'self.settingsDialogInstance.ui.comboBoxProxyType.currentText())[0:5]', self.settingsDialogInstance.ui.comboBoxProxyType.currentText()[0:5]
-            if shared.config.get('bitmessagesettings', 'socksproxytype') == 'none' and self.settingsDialogInstance.ui.comboBoxProxyType.currentText()[0:5] == 'SOCKS':
+            if BMConfigParser().get('bitmessagesettings', 'socksproxytype') == 'none' and self.settingsDialogInstance.ui.comboBoxProxyType.currentText()[0:5] == 'SOCKS':
                 if shared.statusIconColor != 'red':
                     QMessageBox.about(self, _translate("MainWindow", "Restart"), _translate(
                         "MainWindow", "Bitmessage will use your proxy from now on but you may want to manually restart Bitmessage now to close existing connections (if any)."))
-            if shared.config.get('bitmessagesettings', 'socksproxytype')[0:5] == 'SOCKS' and self.settingsDialogInstance.ui.comboBoxProxyType.currentText()[0:5] != 'SOCKS':
+            if BMConfigParser().get('bitmessagesettings', 'socksproxytype')[0:5] == 'SOCKS' and self.settingsDialogInstance.ui.comboBoxProxyType.currentText()[0:5] != 'SOCKS':
                 self.statusBar().clearMessage()
+            state.resetNetworkProtocolAvailability() # just in case we changed something in the network connectivity
             if self.settingsDialogInstance.ui.comboBoxProxyType.currentText()[0:5] == 'SOCKS':
-                shared.config.set('bitmessagesettings', 'socksproxytype', str(
+                BMConfigParser().set('bitmessagesettings', 'socksproxytype', str(
                     self.settingsDialogInstance.ui.comboBoxProxyType.currentText()))
             else:
-                shared.config.set('bitmessagesettings', 'socksproxytype', 'none')
-            shared.config.set('bitmessagesettings', 'socksauthentication', str(
+                BMConfigParser().set('bitmessagesettings', 'socksproxytype', 'none')
+            BMConfigParser().set('bitmessagesettings', 'socksauthentication', str(
                 self.settingsDialogInstance.ui.checkBoxAuthentication.isChecked()))
-            shared.config.set('bitmessagesettings', 'sockshostname', str(
+            BMConfigParser().set('bitmessagesettings', 'sockshostname', str(
                 self.settingsDialogInstance.ui.lineEditSocksHostname.text()))
-            shared.config.set('bitmessagesettings', 'socksport', str(
+            BMConfigParser().set('bitmessagesettings', 'socksport', str(
                 self.settingsDialogInstance.ui.lineEditSocksPort.text()))
-            shared.config.set('bitmessagesettings', 'socksusername', str(
+            BMConfigParser().set('bitmessagesettings', 'socksusername', str(
                 self.settingsDialogInstance.ui.lineEditSocksUsername.text()))
-            shared.config.set('bitmessagesettings', 'sockspassword', str(
+            BMConfigParser().set('bitmessagesettings', 'sockspassword', str(
                 self.settingsDialogInstance.ui.lineEditSocksPassword.text()))
-            shared.config.set('bitmessagesettings', 'sockslisten', str(
+            BMConfigParser().set('bitmessagesettings', 'sockslisten', str(
                 self.settingsDialogInstance.ui.checkBoxSocksListen.isChecked()))
             try:
                 # Rounding to integers just for aesthetics
-                shared.config.set('bitmessagesettings', 'maxdownloadrate', str(
+                BMConfigParser().set('bitmessagesettings', 'maxdownloadrate', str(
                     int(float(self.settingsDialogInstance.ui.lineEditMaxDownloadRate.text()))))
-                shared.config.set('bitmessagesettings', 'maxuploadrate', str(
+                BMConfigParser().set('bitmessagesettings', 'maxuploadrate', str(
                     int(float(self.settingsDialogInstance.ui.lineEditMaxUploadRate.text()))))
             except:
                 QMessageBox.about(self, _translate("MainWindow", "Number needed"), _translate(
                     "MainWindow", "Your maximum download and upload rate must be numbers. Ignoring what you typed."))
 
-            shared.config.set('bitmessagesettings', 'namecoinrpctype',
+            BMConfigParser().set('bitmessagesettings', 'maxoutboundconnections', str(
+                int(float(self.settingsDialogInstance.ui.lineEditMaxOutboundConnections.text()))))
+
+            throttle.SendThrottle().resetLimit()
+            throttle.ReceiveThrottle().resetLimit()
+
+            BMConfigParser().set('bitmessagesettings', 'namecoinrpctype',
                 self.settingsDialogInstance.getNamecoinType())
-            shared.config.set('bitmessagesettings', 'namecoinrpchost', str(
+            BMConfigParser().set('bitmessagesettings', 'namecoinrpchost', str(
                 self.settingsDialogInstance.ui.lineEditNamecoinHost.text()))
-            shared.config.set('bitmessagesettings', 'namecoinrpcport', str(
+            BMConfigParser().set('bitmessagesettings', 'namecoinrpcport', str(
                 self.settingsDialogInstance.ui.lineEditNamecoinPort.text()))
-            shared.config.set('bitmessagesettings', 'namecoinrpcuser', str(
+            BMConfigParser().set('bitmessagesettings', 'namecoinrpcuser', str(
                 self.settingsDialogInstance.ui.lineEditNamecoinUser.text()))
-            shared.config.set('bitmessagesettings', 'namecoinrpcpassword', str(
+            BMConfigParser().set('bitmessagesettings', 'namecoinrpcpassword', str(
                 self.settingsDialogInstance.ui.lineEditNamecoinPassword.text()))
             
             # Demanded difficulty tab
             if float(self.settingsDialogInstance.ui.lineEditTotalDifficulty.text()) >= 1:
-                shared.config.set('bitmessagesettings', 'defaultnoncetrialsperbyte', str(int(float(
-                    self.settingsDialogInstance.ui.lineEditTotalDifficulty.text()) * shared.networkDefaultProofOfWorkNonceTrialsPerByte)))
+                BMConfigParser().set('bitmessagesettings', 'defaultnoncetrialsperbyte', str(int(float(
+                    self.settingsDialogInstance.ui.lineEditTotalDifficulty.text()) * defaults.networkDefaultProofOfWorkNonceTrialsPerByte)))
             if float(self.settingsDialogInstance.ui.lineEditSmallMessageDifficulty.text()) >= 1:
-                shared.config.set('bitmessagesettings', 'defaultpayloadlengthextrabytes', str(int(float(
-                    self.settingsDialogInstance.ui.lineEditSmallMessageDifficulty.text()) * shared.networkDefaultPayloadLengthExtraBytes)))
+                BMConfigParser().set('bitmessagesettings', 'defaultpayloadlengthextrabytes', str(int(float(
+                    self.settingsDialogInstance.ui.lineEditSmallMessageDifficulty.text()) * defaults.networkDefaultPayloadLengthExtraBytes)))
 
-            if self.settingsDialogInstance.ui.checkBoxOpenCL.currentText().toUtf8() != shared.safeConfigGet("bitmessagesettings", "opencl"):
-                shared.config.set('bitmessagesettings', 'opencl', self.settingsDialogInstance.ui.checkBoxOpenCL.currentText().toUtf8())
+            if self.settingsDialogInstance.ui.comboBoxOpenCL.currentText().toUtf8() != BMConfigParser().safeGet("bitmessagesettings", "opencl"):
+                BMConfigParser().set('bitmessagesettings', 'opencl', str(self.settingsDialogInstance.ui.comboBoxOpenCL.currentText()))
+                queues.workerQueue.put(('resetPoW', ''))
 
             acceptableDifficultyChanged = False
             
             if float(self.settingsDialogInstance.ui.lineEditMaxAcceptableTotalDifficulty.text()) >= 1 or float(self.settingsDialogInstance.ui.lineEditMaxAcceptableTotalDifficulty.text()) == 0:
-                if shared.config.get('bitmessagesettings','maxacceptablenoncetrialsperbyte') != str(int(float(
-                    self.settingsDialogInstance.ui.lineEditMaxAcceptableTotalDifficulty.text()) * shared.networkDefaultProofOfWorkNonceTrialsPerByte)):
+                if BMConfigParser().get('bitmessagesettings','maxacceptablenoncetrialsperbyte') != str(int(float(
+                    self.settingsDialogInstance.ui.lineEditMaxAcceptableTotalDifficulty.text()) * defaults.networkDefaultProofOfWorkNonceTrialsPerByte)):
                     # the user changed the max acceptable total difficulty
                     acceptableDifficultyChanged = True
-                    shared.config.set('bitmessagesettings', 'maxacceptablenoncetrialsperbyte', str(int(float(
-                        self.settingsDialogInstance.ui.lineEditMaxAcceptableTotalDifficulty.text()) * shared.networkDefaultProofOfWorkNonceTrialsPerByte)))
+                    BMConfigParser().set('bitmessagesettings', 'maxacceptablenoncetrialsperbyte', str(int(float(
+                        self.settingsDialogInstance.ui.lineEditMaxAcceptableTotalDifficulty.text()) * defaults.networkDefaultProofOfWorkNonceTrialsPerByte)))
             if float(self.settingsDialogInstance.ui.lineEditMaxAcceptableSmallMessageDifficulty.text()) >= 1 or float(self.settingsDialogInstance.ui.lineEditMaxAcceptableSmallMessageDifficulty.text()) == 0:
-                if shared.config.get('bitmessagesettings','maxacceptablepayloadlengthextrabytes') != str(int(float(
-                    self.settingsDialogInstance.ui.lineEditMaxAcceptableSmallMessageDifficulty.text()) * shared.networkDefaultPayloadLengthExtraBytes)):
+                if BMConfigParser().get('bitmessagesettings','maxacceptablepayloadlengthextrabytes') != str(int(float(
+                    self.settingsDialogInstance.ui.lineEditMaxAcceptableSmallMessageDifficulty.text()) * defaults.networkDefaultPayloadLengthExtraBytes)):
                     # the user changed the max acceptable small message difficulty
                     acceptableDifficultyChanged = True
-                    shared.config.set('bitmessagesettings', 'maxacceptablepayloadlengthextrabytes', str(int(float(
-                        self.settingsDialogInstance.ui.lineEditMaxAcceptableSmallMessageDifficulty.text()) * shared.networkDefaultPayloadLengthExtraBytes)))
+                    BMConfigParser().set('bitmessagesettings', 'maxacceptablepayloadlengthextrabytes', str(int(float(
+                        self.settingsDialogInstance.ui.lineEditMaxAcceptableSmallMessageDifficulty.text()) * defaults.networkDefaultPayloadLengthExtraBytes)))
             if acceptableDifficultyChanged:
                 # It might now be possible to send msgs which were previously marked as toodifficult. 
                 # Let us change them to 'msgqueued'. The singleWorker will try to send them and will again
                 # mark them as toodifficult if the receiver's required difficulty is still higher than
                 # we are willing to do.
                 sqlExecute('''UPDATE sent SET status='msgqueued' WHERE status='toodifficult' ''')
-                shared.workerQueue.put(('sendmessage', ''))
+                queues.workerQueue.put(('sendmessage', ''))
             
             #start:UI setting to stop trying to send messages after X days/months
             # I'm open to changing this UI to something else if someone has a better idea.
             if ((self.settingsDialogInstance.ui.lineEditDays.text()=='') and (self.settingsDialogInstance.ui.lineEditMonths.text()=='')):#We need to handle this special case. Bitmessage has its default behavior. The input is blank/blank
-                shared.config.set('bitmessagesettings', 'stopresendingafterxdays', '')
-                shared.config.set('bitmessagesettings', 'stopresendingafterxmonths', '')
+                BMConfigParser().set('bitmessagesettings', 'stopresendingafterxdays', '')
+                BMConfigParser().set('bitmessagesettings', 'stopresendingafterxmonths', '')
                 shared.maximumLengthOfTimeToBotherResendingMessages = float('inf')
             try:
                 float(self.settingsDialogInstance.ui.lineEditDays.text())
@@ -2461,22 +2496,22 @@ class MyForm(settingsmixin.SMainWindow):
                     if shared.maximumLengthOfTimeToBotherResendingMessages < 432000: # If the time period is less than 5 hours, we give zero values to all fields. No message will be sent again.
                         QMessageBox.about(self, _translate("MainWindow", "Will not resend ever"), _translate(
                             "MainWindow", "Note that the time limit you entered is less than the amount of time Bitmessage waits for the first resend attempt therefore your messages will never be resent."))
-                        shared.config.set('bitmessagesettings', 'stopresendingafterxdays', '0')
-                        shared.config.set('bitmessagesettings', 'stopresendingafterxmonths', '0')
+                        BMConfigParser().set('bitmessagesettings', 'stopresendingafterxdays', '0')
+                        BMConfigParser().set('bitmessagesettings', 'stopresendingafterxmonths', '0')
                         shared.maximumLengthOfTimeToBotherResendingMessages = 0
                     else:
-                        shared.config.set('bitmessagesettings', 'stopresendingafterxdays', str(float(
+                        BMConfigParser().set('bitmessagesettings', 'stopresendingafterxdays', str(float(
                         self.settingsDialogInstance.ui.lineEditDays.text())))
-                        shared.config.set('bitmessagesettings', 'stopresendingafterxmonths', str(float(
+                        BMConfigParser().set('bitmessagesettings', 'stopresendingafterxmonths', str(float(
                         self.settingsDialogInstance.ui.lineEditMonths.text())))
 
-            shared.writeKeysFile()
+            BMConfigParser().save()
 
             if 'win32' in sys.platform or 'win64' in sys.platform:
             # Auto-startup for Windows
                 RUN_PATH = "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
                 self.settings = QSettings(RUN_PATH, QSettings.NativeFormat)
-                if shared.config.getboolean('bitmessagesettings', 'startonlogon'):
+                if BMConfigParser().getboolean('bitmessagesettings', 'startonlogon'):
                     self.settings.setValue("PyBitmessage", sys.argv[0])
                 else:
                     self.settings.remove("PyBitmessage")
@@ -2487,21 +2522,17 @@ class MyForm(settingsmixin.SMainWindow):
                 # startup for linux
                 pass
 
-            if shared.appdata != shared.lookupExeFolder() and self.settingsDialogInstance.ui.checkBoxPortableMode.isChecked():  # If we are NOT using portable mode now but the user selected that we should...
+            if state.appdata != paths.lookupExeFolder() and self.settingsDialogInstance.ui.checkBoxPortableMode.isChecked():  # If we are NOT using portable mode now but the user selected that we should...
                 # Write the keys.dat file to disk in the new location
                 sqlStoredProcedure('movemessagstoprog')
-                with open(shared.lookupExeFolder() + 'keys.dat', 'wb') as configfile:
-                    shared.config.write(configfile)
+                with open(paths.lookupExeFolder() + 'keys.dat', 'wb') as configfile:
+                    BMConfigParser().write(configfile)
                 # Write the knownnodes.dat file to disk in the new location
-                shared.knownNodesLock.acquire()
-                output = open(shared.lookupExeFolder() + 'knownnodes.dat', 'wb')
-                pickle.dump(shared.knownNodes, output)
-                output.close()
-                shared.knownNodesLock.release()
-                os.remove(shared.appdata + 'keys.dat')
-                os.remove(shared.appdata + 'knownnodes.dat')
-                previousAppdataLocation = shared.appdata
-                shared.appdata = shared.lookupExeFolder()
+                knownnodes.saveKnownNodes(paths.lookupExeFolder())
+                os.remove(state.appdata + 'keys.dat')
+                os.remove(state.appdata + 'knownnodes.dat')
+                previousAppdataLocation = state.appdata
+                state.appdata = paths.lookupExeFolder()
                 debug.restartLoggingInUpdatedAppdataLocation()
                 try:
                     os.remove(previousAppdataLocation + 'debug.log')
@@ -2509,25 +2540,21 @@ class MyForm(settingsmixin.SMainWindow):
                 except:
                     pass
 
-            if shared.appdata == shared.lookupExeFolder() and not self.settingsDialogInstance.ui.checkBoxPortableMode.isChecked():  # If we ARE using portable mode now but the user selected that we shouldn't...
-                shared.appdata = shared.lookupAppdataFolder()
-                if not os.path.exists(shared.appdata):
-                    os.makedirs(shared.appdata)
+            if state.appdata == paths.lookupExeFolder() and not self.settingsDialogInstance.ui.checkBoxPortableMode.isChecked():  # If we ARE using portable mode now but the user selected that we shouldn't...
+                state.appdata = paths.lookupAppdataFolder()
+                if not os.path.exists(state.appdata):
+                    os.makedirs(state.appdata)
                 sqlStoredProcedure('movemessagstoappdata')
                 # Write the keys.dat file to disk in the new location
-                shared.writeKeysFile()
+                BMConfigParser().save()
                 # Write the knownnodes.dat file to disk in the new location
-                shared.knownNodesLock.acquire()
-                output = open(shared.appdata + 'knownnodes.dat', 'wb')
-                pickle.dump(shared.knownNodes, output)
-                output.close()
-                shared.knownNodesLock.release()
-                os.remove(shared.lookupExeFolder() + 'keys.dat')
-                os.remove(shared.lookupExeFolder() + 'knownnodes.dat')
+                knownnodes.saveKnownNodes(state.appdata)
+                os.remove(paths.lookupExeFolder() + 'keys.dat')
+                os.remove(paths.lookupExeFolder() + 'knownnodes.dat')
                 debug.restartLoggingInUpdatedAppdataLocation()
                 try:
-                    os.remove(shared.lookupExeFolder() + 'debug.log')
-                    os.remove(shared.lookupExeFolder() + 'debug.log.1')
+                    os.remove(paths.lookupExeFolder() + 'debug.log')
+                    os.remove(paths.lookupExeFolder() + 'debug.log.1')
                 except:
                     pass
 
@@ -2536,26 +2563,26 @@ class MyForm(settingsmixin.SMainWindow):
         # For Modal dialogs
         if self.dialog.exec_():
             addressAtCurrentRow = self.getCurrentAccount()
-            if shared.safeConfigGetBoolean(addressAtCurrentRow, 'chan'):
+            if BMConfigParser().safeGetBoolean(addressAtCurrentRow, 'chan'):
                 return
             if self.dialog.ui.radioButtonBehaveNormalAddress.isChecked():
-                shared.config.set(str(
+                BMConfigParser().set(str(
                     addressAtCurrentRow), 'mailinglist', 'false')
                 # Set the color to either black or grey
-                if shared.config.getboolean(addressAtCurrentRow, 'enabled'):
+                if BMConfigParser().getboolean(addressAtCurrentRow, 'enabled'):
                     self.setCurrentItemColor(QApplication.palette()
                         .text().color())
                 else:
                     self.setCurrentItemColor(QtGui.QColor(128, 128, 128))
             else:
-                shared.config.set(str(
+                BMConfigParser().set(str(
                     addressAtCurrentRow), 'mailinglist', 'true')
-                shared.config.set(str(addressAtCurrentRow), 'mailinglistname', str(
+                BMConfigParser().set(str(addressAtCurrentRow), 'mailinglistname', str(
                     self.dialog.ui.lineEditMailingListName.text().toUtf8()))
                 self.setCurrentItemColor(QtGui.QColor(137, 04, 177)) #magenta
             self.rerenderComboBoxSendFrom()
             self.rerenderComboBoxSendFromBroadcast()
-            shared.writeKeysFile()
+            BMConfigParser().save()
             self.rerenderMessagelistToLabels()
 
     def on_action_EmailGatewayDialog(self):
@@ -2569,8 +2596,8 @@ class MyForm(settingsmixin.SMainWindow):
                 return
             if self.dialog.ui.radioButtonUnregister.isChecked() and isinstance(acct, GatewayAccount):
                 acct.unregister()
-                shared.config.remove_option(addressAtCurrentRow, 'gateway')
-                shared.writeKeysFile()
+                BMConfigParser().remove_option(addressAtCurrentRow, 'gateway')
+                BMConfigParser().save()
                 self.statusBar().showMessage(_translate(
                      "MainWindow", "Sending email gateway unregistration request"), 10000)
             elif self.dialog.ui.radioButtonStatus.isChecked() and isinstance(acct, GatewayAccount):
@@ -2595,9 +2622,9 @@ class MyForm(settingsmixin.SMainWindow):
                 email = str(self.dialog.ui.lineEditEmail.text().toUtf8())
                 acct = MailchuckAccount(addressAtCurrentRow)
                 acct.register(email)
-                shared.config.set(addressAtCurrentRow, 'label', email)
-                shared.config.set(addressAtCurrentRow, 'gateway', 'mailchuck')
-                shared.writeKeysFile()
+                BMConfigParser().set(addressAtCurrentRow, 'label', email)
+                BMConfigParser().set(addressAtCurrentRow, 'gateway', 'mailchuck')
+                BMConfigParser().save()
                 self.statusBar().showMessage(_translate(
                      "MainWindow", "Sending email gateway registration request"), 10000)
             else:
@@ -2607,6 +2634,16 @@ class MyForm(settingsmixin.SMainWindow):
 #            self.rerenderInboxToLabels()
 
     def on_action_MarkAllRead(self):
+        def partialUpdate(folder, msgids):
+            if len(msgids) == 0:
+                return 0
+            if folder == 'sent':
+                return sqlExecute(
+                    "UPDATE sent SET read = 1 WHERE ackdata IN(%s) AND read=0" %(",".join("?"*len(msgids))), *msgids)
+            else:
+                return sqlExecute(
+                    "UPDATE inbox SET read = 1 WHERE msgid IN(%s) AND read=0" %(",".join("?"*len(msgids))), *msgids)
+
         if QtGui.QMessageBox.question(self, "Marking all messages as read?", _translate("MainWindow", "Are you sure you would like to mark all messages read?"), QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes:
             return
         addressAtCurrentRow = self.getCurrentAccount()
@@ -2620,6 +2657,8 @@ class MyForm(settingsmixin.SMainWindow):
         font = QFont()
         font.setBold(False)
 
+        markread = 0
+
         for i in range(0, tableWidget.rowCount()):
             msgids.append(str(tableWidget.item(
                 i, 3).data(Qt.UserRole).toPyObject()))
@@ -2627,14 +2666,13 @@ class MyForm(settingsmixin.SMainWindow):
             tableWidget.item(i, 1).setUnread(False)
             tableWidget.item(i, 2).setUnread(False)
             tableWidget.item(i, 3).setFont(font)
+            # sqlite default limit, unfortunately getting/setting isn't exposed to python
+            if i % 999 == 999: 
+                markread += partialUpdate(self.getCurrentFolder(), msgids)
+                msgids = []
 
-        markread = 0
-        if self.getCurrentFolder() == 'sent':
-            markread = sqlExecute(
-               "UPDATE sent SET read = 1 WHERE ackdata IN(%s) AND read=0" %(",".join("?"*len(msgids))), *msgids)
-        else:
-            markread = sqlExecute(
-               "UPDATE inbox SET read = 1 WHERE msgid IN(%s) AND read=0" %(",".join("?"*len(msgids))), *msgids)
+        if len(msgids) > 0:
+            markread += partialUpdate(self.getCurrentFolder(), msgids)
 
         if markread > 0:
             self.propagateUnreadCount(addressAtCurrentRow, self.getCurrentFolder(), None, 0)
@@ -2660,7 +2698,7 @@ class MyForm(settingsmixin.SMainWindow):
                     # address.'
                     streamNumberForAddress = decodeAddress(
                         self.dialog.ui.comboBoxExisting.currentText())[2]
-                shared.addressGeneratorQueue.put(('createRandomAddress', 4, streamNumberForAddress, str(
+                queues.addressGeneratorQueue.put(('createRandomAddress', 4, streamNumberForAddress, str(
                     self.dialog.ui.newaddresslabel.text().toUtf8()), 1, "", self.dialog.ui.checkBoxEighteenByteRipe.isChecked()))
             else:
                 if self.dialog.ui.lineEditPassphrase.text() != self.dialog.ui.lineEditPassphraseAgain.text():
@@ -2671,7 +2709,7 @@ class MyForm(settingsmixin.SMainWindow):
                         "MainWindow", "Choose a passphrase"), _translate("MainWindow", "You really do need a passphrase."))
                 else:
                     streamNumberForAddress = 1  # this will eventually have to be replaced by logic to determine the most available stream number.
-                    shared.addressGeneratorQueue.put(('createDeterministicAddresses', 4, streamNumberForAddress, "unused deterministic address", self.dialog.ui.spinBoxNumberOfAddressesToMake.value(
+                    queues.addressGeneratorQueue.put(('createDeterministicAddresses', 4, streamNumberForAddress, "unused deterministic address", self.dialog.ui.spinBoxNumberOfAddressesToMake.value(
                     ), self.dialog.ui.lineEditPassphrase.text().toUtf8(), self.dialog.ui.checkBoxEighteenByteRipe.isChecked()))
         else:
             logger.debug('new address dialog box rejected')
@@ -2686,6 +2724,9 @@ class MyForm(settingsmixin.SMainWindow):
             return
         '''
 
+        if self.quitAccepted:
+            return
+
         self.show()
         self.raise_()
         self.activateWindow()
@@ -2695,10 +2736,10 @@ class MyForm(settingsmixin.SMainWindow):
         waitForSync = False
 
         # C PoW currently doesn't support interrupting and OpenCL is untested
-        if getPowType() == "python" and (powQueueSize() > 0 or invQueueSize() > 0):
+        if getPowType() == "python" and (powQueueSize() > 0 or PendingUpload().len() > 0):
             reply = QtGui.QMessageBox.question(self, _translate("MainWindow", "Proof of work pending"),
                     _translate("MainWindow", "%n object(s) pending proof of work", None, QtCore.QCoreApplication.CodecForTr, powQueueSize()) + ", " +
-                    _translate("MainWindow", "%n object(s) waiting to be distributed", None, QtCore.QCoreApplication.CodecForTr, invQueueSize()) + "\n\n" + 
+                    _translate("MainWindow", "%n object(s) waiting to be distributed", None, QtCore.QCoreApplication.CodecForTr, PendingUpload().len()) + "\n\n" + 
                     _translate("MainWindow", "Wait until these tasks finish?"),
                     QtGui.QMessageBox.Yes|QtGui.QMessageBox.No|QtGui.QMessageBox.Cancel, QtGui.QMessageBox.Cancel)
             if reply == QtGui.QMessageBox.No:
@@ -2706,16 +2747,16 @@ class MyForm(settingsmixin.SMainWindow):
             elif reply == QtGui.QMessage.Cancel:
                 return
 
-        toBeDownloaded = sum(shared.numberOfObjectsThatWeHaveYetToGetPerPeer.itervalues())
-
-        if toBeDownloaded > 0:
+        if PendingDownload().len() > 0:
             reply = QtGui.QMessageBox.question(self, _translate("MainWindow", "Synchronisation pending"),
-                    _translate("MainWindow", "Bitmessage hasn't synchronised with the network, %n object(s) to be downloaded. If you quit now, it may cause delivery delays. Wait until the synchronisation finishes?", None, QtCore.QCoreApplication.CodecForTr, toBeDownloaded),
+                    _translate("MainWindow", "Bitmessage hasn't synchronised with the network, %n object(s) to be downloaded. If you quit now, it may cause delivery delays. Wait until the synchronisation finishes?", None, QtCore.QCoreApplication.CodecForTr, PendingDownload().len()),
                     QtGui.QMessageBox.Yes|QtGui.QMessageBox.No|QtGui.QMessageBox.Cancel, QtGui.QMessageBox.Cancel)
             if reply == QtGui.QMessageBox.Yes:
                 waitForSync = True
             elif reply == QtGui.QMessageBox.Cancel:
                 return
+            else:
+                PendingDownload().stop()
 
         if shared.statusIconColor == 'red':
             reply = QtGui.QMessageBox.question(self, _translate("MainWindow", "Not connected"),
@@ -2726,6 +2767,8 @@ class MyForm(settingsmixin.SMainWindow):
                 waitForSync = True
             elif reply == QtGui.QMessageBox.Cancel:
                 return
+
+        self.quitAccepted = True
 
         self.statusBar().showMessage(_translate(
             "MainWindow", "Shutting down PyBitmessage... %1%").arg(str(0)))
@@ -2741,7 +2784,7 @@ class MyForm(settingsmixin.SMainWindow):
         if waitForSync:
             self.statusBar().showMessage(_translate(
                 "MainWindow", "Waiting for finishing synchronisation..."))
-            while sum(shared.numberOfObjectsThatWeHaveYetToGetPerPeer.itervalues()) > 0:
+            while PendingDownload().len() > 0:
                 time.sleep(0.5)
                 QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 1000)
 
@@ -2766,22 +2809,17 @@ class MyForm(settingsmixin.SMainWindow):
                 time.sleep(0.5) # a bit of time so that the hashHolder is populated
             QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 1000)
         
-            # check if objectHashHolder empty
+            # check if upload (of objects created locally) pending
             self.statusBar().showMessage(_translate("MainWindow", "Waiting for objects to be sent... %1%").arg(str(50)))
-            maxWaitingObjects = 0
-            curWaitingObjects = invQueueSize()
-            while curWaitingObjects > 0:
-                curWaitingObjects = invQueueSize()
-                if curWaitingObjects > maxWaitingObjects:
-                    maxWaitingObjects = curWaitingObjects
-                if curWaitingObjects > 0:
-                    self.statusBar().showMessage(_translate("MainWindow", "Waiting for objects to be sent... %1%").arg(str(50 + 20 * (maxWaitingObjects - curWaitingObjects) / maxWaitingObjects)))
+            try:
+                while PendingUpload().progress() < 1:
+                    self.statusBar().showMessage(_translate("MainWindow", "Waiting for objects to be sent... %1%").arg(str(int(50 + 20 * PendingUpload().progress()))))
                     time.sleep(0.5)
                     QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 1000)
+            except PendingUploadDeadlineException:
+                pass
 
             QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 1000)
-            if maxWorkerQueue > 0 or maxWaitingObjects > 0:
-                time.sleep(10) # a bit of time so that the other nodes retrieve the objects
         QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 1000)
 
         # save state and geometry self and all widgets
@@ -2796,7 +2834,7 @@ class MyForm(settingsmixin.SMainWindow):
 
         self.statusBar().showMessage(_translate("MainWindow", "Shutting down core... %1%").arg(str(80)))
         QtCore.QCoreApplication.processEvents(QtCore.QEventLoop.AllEvents, 1000)
-        shared.doCleanShutdown()
+        shutdown.doCleanShutdown()
         self.statusBar().showMessage(_translate("MainWindow", "Stopping notifications... %1%").arg(str(90)))
         self.tray.hide()
         # unregister the messaging system
@@ -2806,6 +2844,8 @@ class MyForm(settingsmixin.SMainWindow):
         self.statusBar().showMessage(_translate("MainWindow", "Shutdown imminent... %1%").arg(str(100)))
         shared.thisapp.cleanup()
         logger.info("Shutdown complete")
+        super(MyForm, myapp).close()
+        #return
         os._exit(0)
 
     # window close event
@@ -2814,12 +2854,16 @@ class MyForm(settingsmixin.SMainWindow):
         trayonclose = False
 
         try:
-            trayonclose = shared.config.getboolean(
+            trayonclose = BMConfigParser().getboolean(
                 'bitmessagesettings', 'trayonclose')
         except Exception:
             pass
 
         # always ignore, it shuts down by itself
+        if self.quitAccepted:
+            event.accept()
+            return
+
         event.ignore()
         if not trayonclose:
             # quit the application
@@ -2889,7 +2933,7 @@ class MyForm(settingsmixin.SMainWindow):
 
     # Format predefined text on message reply.
     def quoted_text(self, message):
-        if not shared.safeConfigGetBoolean('bitmessagesettings', 'replybelow'):
+        if not BMConfigParser().safeGetBoolean('bitmessagesettings', 'replybelow'):
           return '\n\n------------------------------------------------------\n' + message
 
         quoteWrapper = textwrap.TextWrapper(replace_whitespace = False,
@@ -2960,10 +3004,10 @@ class MyForm(settingsmixin.SMainWindow):
         if toAddressAtCurrentInboxRow == str_broadcast_subscribers:
             self.ui.tabWidgetSend.setCurrentIndex(0)
 #            toAddressAtCurrentInboxRow = fromAddressAtCurrentInboxRow
-        elif not shared.config.has_section(toAddressAtCurrentInboxRow):
+        elif not BMConfigParser().has_section(toAddressAtCurrentInboxRow):
             QtGui.QMessageBox.information(self, _translate("MainWindow", "Address is gone"), _translate(
                 "MainWindow", "Bitmessage cannot find your address %1. Perhaps you removed it?").arg(toAddressAtCurrentInboxRow), QMessageBox.Ok)
-        elif not shared.config.getboolean(toAddressAtCurrentInboxRow, 'enabled'):
+        elif not BMConfigParser().getboolean(toAddressAtCurrentInboxRow, 'enabled'):
             QtGui.QMessageBox.information(self, _translate("MainWindow", "Address disabled"), _translate(
                 "MainWindow", "Error: The address from which you are trying to send is disabled. You\'ll have to enable it on the \'Your Identities\' tab before using it."), QMessageBox.Ok)
         else:
@@ -3037,7 +3081,7 @@ class MyForm(settingsmixin.SMainWindow):
         queryreturn = sqlQuery('''select * from blacklist where address=?''',
                                addressAtCurrentInboxRow)
         if queryreturn == []:
-            label = "\"" + tableWidget.item(currentInboxRow, 2).subject + "\" in " + shared.config.get(recipientAddress, "label")
+            label = "\"" + tableWidget.item(currentInboxRow, 2).subject + "\" in " + BMConfigParser().get(recipientAddress, "label")
             sqlExecute('''INSERT INTO blacklist VALUES (?,?, ?)''',
                        label,
                        addressAtCurrentInboxRow, True)
@@ -3048,7 +3092,7 @@ class MyForm(settingsmixin.SMainWindow):
             self.statusBar().showMessage(_translate(
                 "MainWindow", "Error: You cannot add the same address to your blacklist twice. Try renaming the existing one if you want."), 10000)
 
-    def deleteRowFromMessagelist(row = None, inventoryHash = None, ackData = None, messageLists = None):
+    def deleteRowFromMessagelist(self, row = None, inventoryHash = None, ackData = None, messageLists = None):
         if messageLists is None:
             messageLists = (self.ui.tableWidgetInbox, self.ui.tableWidgetInboxChans, self.ui.tableWidgetInboxSubscriptions)
         elif type(messageLists) not in (list, tuple):
@@ -3190,9 +3234,9 @@ class MyForm(settingsmixin.SMainWindow):
         queryreturn = sqlQuery('''select ackdata FROM sent WHERE status='forcepow' ''')
         for row in queryreturn:
             ackdata, = row
-            shared.UISignalQueue.put(('updateSentItemStatusByAckdata', (
+            queues.UISignalQueue.put(('updateSentItemStatusByAckdata', (
                 ackdata, 'Overriding maximum-difficulty setting. Work queued.')))
-        shared.workerQueue.put(('sendmessage', ''))
+        queues.workerQueue.put(('sendmessage', ''))
 
     def on_action_SentClipboard(self):
         currentRow = self.ui.tableWidgetInbox.currentRow()
@@ -3270,7 +3314,7 @@ class MyForm(settingsmixin.SMainWindow):
                 continue
             labelAtCurrentRow = self.ui.tableWidgetAddressBook.item(currentRow,0).text().toUtf8()
             self.addSubscription(addressAtCurrentRow, labelAtCurrentRow)
-            self.ui.tabWidget.setCurrentIndex(4)
+            self.ui.tabWidget.setCurrentIndex(2)
 
     def on_context_menuAddressBook(self, point):
         self.popMenuAddressBook = QtGui.QMenu(self)
@@ -3529,14 +3573,15 @@ class MyForm(settingsmixin.SMainWindow):
             return # maybe in the future
         elif account.type == AccountMixin.CHAN:
             if QtGui.QMessageBox.question(self, "Delete channel?", _translate("MainWindow", "If you delete the channel, messages that you already received will become inaccessible. Maybe you can consider disabling the channel instead. Disabled channels will not receive new messages, but you can still view messages you already received.\n\nAre you sure you want to delete the channel?"), QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
-                shared.config.remove_section(str(account.address))
+                BMConfigParser().remove_section(str(account.address))
             else:
                 return
         else:
             return
-        shared.writeKeysFile()
+        BMConfigParser().save()
         shared.reloadMyAddressHashes()
         self.rerenderAddressBook()
+        self.rerenderComboBoxSendFrom()
         if account.type == AccountMixin.NORMAL:
             self.rerenderTabTreeMessages()
         elif account.type == AccountMixin.CHAN:
@@ -3549,8 +3594,8 @@ class MyForm(settingsmixin.SMainWindow):
         account.setEnabled(True)
 
     def enableIdentity(self, address):
-        shared.config.set(address, 'enabled', 'true')
-        shared.writeKeysFile()
+        BMConfigParser().set(address, 'enabled', 'true')
+        BMConfigParser().save()
         shared.reloadMyAddressHashes()
         self.rerenderAddressBook()
 
@@ -3561,8 +3606,8 @@ class MyForm(settingsmixin.SMainWindow):
         account.setEnabled(False)
 
     def disableIdentity(self, address):
-        shared.config.set(str(address), 'enabled', 'false')
-        shared.writeKeysFile()
+        BMConfigParser().set(str(address), 'enabled', 'false')
+        BMConfigParser().save()
         shared.reloadMyAddressHashes()
         self.rerenderAddressBook()
 
@@ -3615,8 +3660,8 @@ class MyForm(settingsmixin.SMainWindow):
                 currentRow, 0).setIcon(avatarize(addressAtCurrentRow))
 
     def setAvatar(self, addressAtCurrentRow):
-        if not os.path.exists(shared.appdata + 'avatars/'):
-            os.makedirs(shared.appdata + 'avatars/')
+        if not os.path.exists(state.appdata + 'avatars/'):
+            os.makedirs(state.appdata + 'avatars/')
         hash = hashlib.md5(addBMIfNotPresent(addressAtCurrentRow)).hexdigest()
         extensions = ['PNG', 'GIF', 'JPG', 'JPEG', 'SVG', 'BMP', 'MNG', 'PBM', 'PGM', 'PPM', 'TIFF', 'XBM', 'XPM', 'TGA']
         # http://pyqt.sourceforge.net/Docs/PyQt4/qimagereader.html#supportedImageFormats
@@ -3627,8 +3672,8 @@ class MyForm(settingsmixin.SMainWindow):
         for ext in extensions:
             filters += [ names[ext] + ' (*.' + ext.lower() + ')' ]
             all_images_filter += [ '*.' + ext.lower() ]
-            upper = shared.appdata + 'avatars/' + hash + '.' + ext.upper()
-            lower = shared.appdata + 'avatars/' + hash + '.' + ext.lower()
+            upper = state.appdata + 'avatars/' + hash + '.' + ext.upper()
+            lower = state.appdata + 'avatars/' + hash + '.' + ext.lower()
             if os.path.isfile(lower):
                 current_files += [lower]
             elif os.path.isfile(upper):
@@ -3637,7 +3682,7 @@ class MyForm(settingsmixin.SMainWindow):
         filters[1:1] = ['All files (*.*)']
         sourcefile = QFileDialog.getOpenFileName(self, _translate("MainWindow","Set avatar..."), filter = ';;'.join(filters))
         # determine the correct filename (note that avatars don't use the suffix)
-        destination = shared.appdata + 'avatars/' + hash + '.' + sourcefile.split('.')[-1]
+        destination = state.appdata + 'avatars/' + hash + '.' + sourcefile.split('.')[-1]
         exists = QtCore.QFile.exists(destination)
         if sourcefile == '':
             # ask for removal of avatar
@@ -3916,6 +3961,11 @@ class MyForm(settingsmixin.SMainWindow):
             self.rerenderComboBoxSendFrom()
         self.rerenderMessagelistFromLabels()
         self.rerenderMessagelistToLabels()
+        completerList = self.ui.lineEditTo.completer().model().stringList()
+        for i in range(len(completerList)):
+            if str(completerList[i]).endswith(" <" + item.address + ">"):
+                completerList[i] = item.label + " <" + item.address + ">"
+        self.ui.lineEditTo.completer().model().setStringList(completerList)
 
     def writeNewAddressToTable(self, label, address, streamNumber):
         self.rerenderTabTreeMessages()
@@ -3923,12 +3973,22 @@ class MyForm(settingsmixin.SMainWindow):
         self.rerenderTabTreeChans()
         self.rerenderComboBoxSendFrom()
         self.rerenderComboBoxSendFromBroadcast()
+        self.rerenderAddressBook()
 
     def updateStatusBar(self, data):
-        if data != "":
-            logger.info('Status bar: ' + data)
+        if type(data) is tuple or type(data) is list:
+            option = data[1]
+            message = data[0]
+        else:
+            option = 0
+            message = data
+        if message != "":
+            logger.info('Status bar: ' + message)
 
-        self.statusBar().showMessage(data, 10000)
+        if option == 1:
+            self.statusBar().addImportant(message)
+        else:
+            self.statusBar().showMessage(message, 10000)
 
     def initSettings(self):
         QtCore.QCoreApplication.setOrganizationName("PyBitmessage")
@@ -3968,7 +4028,8 @@ class aboutDialog(QtGui.QDialog):
         self.ui = Ui_aboutDialog()
         self.ui.setupUi(self)
         self.parent = parent
-        self.ui.labelVersion.setText('version ' + shared.softwareVersion)
+        self.ui.label.setText("PyBitmessage " + softwareVersion)
+        self.ui.labelVersion.setText(paths.lastCommit())
 
 
 class regenerateAddressesDialog(QtGui.QDialog):
@@ -3988,30 +4049,30 @@ class settingsDialog(QtGui.QDialog):
         self.ui.setupUi(self)
         self.parent = parent
         self.ui.checkBoxStartOnLogon.setChecked(
-            shared.config.getboolean('bitmessagesettings', 'startonlogon'))
+            BMConfigParser().getboolean('bitmessagesettings', 'startonlogon'))
         self.ui.checkBoxMinimizeToTray.setChecked(
-            shared.config.getboolean('bitmessagesettings', 'minimizetotray'))
+            BMConfigParser().getboolean('bitmessagesettings', 'minimizetotray'))
         self.ui.checkBoxTrayOnClose.setChecked(
-            shared.safeConfigGetBoolean('bitmessagesettings', 'trayonclose'))
+            BMConfigParser().safeGetBoolean('bitmessagesettings', 'trayonclose'))
         self.ui.checkBoxHideTrayConnectionNotifications.setChecked(
-            shared.config.getboolean("bitmessagesettings", "hidetrayconnectionnotifications"))
+            BMConfigParser().getboolean("bitmessagesettings", "hidetrayconnectionnotifications"))
         self.ui.checkBoxShowTrayNotifications.setChecked(
-            shared.config.getboolean('bitmessagesettings', 'showtraynotifications'))
+            BMConfigParser().getboolean('bitmessagesettings', 'showtraynotifications'))
         self.ui.checkBoxStartInTray.setChecked(
-            shared.config.getboolean('bitmessagesettings', 'startintray'))
+            BMConfigParser().getboolean('bitmessagesettings', 'startintray'))
         self.ui.checkBoxWillinglySendToMobile.setChecked(
-            shared.safeConfigGetBoolean('bitmessagesettings', 'willinglysendtomobile'))
+            BMConfigParser().safeGetBoolean('bitmessagesettings', 'willinglysendtomobile'))
         self.ui.checkBoxUseIdenticons.setChecked(
-            shared.safeConfigGetBoolean('bitmessagesettings', 'useidenticons'))
+            BMConfigParser().safeGetBoolean('bitmessagesettings', 'useidenticons'))
         self.ui.checkBoxReplyBelow.setChecked(
-            shared.safeConfigGetBoolean('bitmessagesettings', 'replybelow'))
+            BMConfigParser().safeGetBoolean('bitmessagesettings', 'replybelow'))
         
-        if shared.appdata == shared.lookupExeFolder():
+        if state.appdata == paths.lookupExeFolder():
             self.ui.checkBoxPortableMode.setChecked(True)
         else:
             try:
                 import tempfile
-                file = tempfile.NamedTemporaryFile(dir=shared.lookupExeFolder(), delete=True)
+                file = tempfile.NamedTemporaryFile(dir=paths.lookupExeFolder(), delete=True)
                 file.close # should autodelete
             except:
                 self.ui.checkBoxPortableMode.setDisabled(True)
@@ -4032,14 +4093,14 @@ class settingsDialog(QtGui.QDialog):
                 "MainWindow", "Start-on-login not yet supported on your OS."))
         # On the Network settings tab:
         self.ui.lineEditTCPPort.setText(str(
-            shared.config.get('bitmessagesettings', 'port')))
+            BMConfigParser().get('bitmessagesettings', 'port')))
         self.ui.checkBoxUPnP.setChecked(
-            shared.safeConfigGetBoolean('bitmessagesettings', 'upnp'))
-        self.ui.checkBoxAuthentication.setChecked(shared.config.getboolean(
+            BMConfigParser().safeGetBoolean('bitmessagesettings', 'upnp'))
+        self.ui.checkBoxAuthentication.setChecked(BMConfigParser().getboolean(
             'bitmessagesettings', 'socksauthentication'))
-        self.ui.checkBoxSocksListen.setChecked(shared.config.getboolean(
+        self.ui.checkBoxSocksListen.setChecked(BMConfigParser().getboolean(
             'bitmessagesettings', 'sockslisten'))
-        if str(shared.config.get('bitmessagesettings', 'socksproxytype')) == 'none':
+        if str(BMConfigParser().get('bitmessagesettings', 'socksproxytype')) == 'none':
             self.ui.comboBoxProxyType.setCurrentIndex(0)
             self.ui.lineEditSocksHostname.setEnabled(False)
             self.ui.lineEditSocksPort.setEnabled(False)
@@ -4047,39 +4108,39 @@ class settingsDialog(QtGui.QDialog):
             self.ui.lineEditSocksPassword.setEnabled(False)
             self.ui.checkBoxAuthentication.setEnabled(False)
             self.ui.checkBoxSocksListen.setEnabled(False)
-        elif str(shared.config.get('bitmessagesettings', 'socksproxytype')) == 'SOCKS4a':
+        elif str(BMConfigParser().get('bitmessagesettings', 'socksproxytype')) == 'SOCKS4a':
             self.ui.comboBoxProxyType.setCurrentIndex(1)
-            self.ui.lineEditTCPPort.setEnabled(False)
-        elif str(shared.config.get('bitmessagesettings', 'socksproxytype')) == 'SOCKS5':
+        elif str(BMConfigParser().get('bitmessagesettings', 'socksproxytype')) == 'SOCKS5':
             self.ui.comboBoxProxyType.setCurrentIndex(2)
-            self.ui.lineEditTCPPort.setEnabled(False)
 
         self.ui.lineEditSocksHostname.setText(str(
-            shared.config.get('bitmessagesettings', 'sockshostname')))
+            BMConfigParser().get('bitmessagesettings', 'sockshostname')))
         self.ui.lineEditSocksPort.setText(str(
-            shared.config.get('bitmessagesettings', 'socksport')))
+            BMConfigParser().get('bitmessagesettings', 'socksport')))
         self.ui.lineEditSocksUsername.setText(str(
-            shared.config.get('bitmessagesettings', 'socksusername')))
+            BMConfigParser().get('bitmessagesettings', 'socksusername')))
         self.ui.lineEditSocksPassword.setText(str(
-            shared.config.get('bitmessagesettings', 'sockspassword')))
+            BMConfigParser().get('bitmessagesettings', 'sockspassword')))
         QtCore.QObject.connect(self.ui.comboBoxProxyType, QtCore.SIGNAL(
             "currentIndexChanged(int)"), self.comboBoxProxyTypeChanged)
         self.ui.lineEditMaxDownloadRate.setText(str(
-            shared.config.get('bitmessagesettings', 'maxdownloadrate')))
+            BMConfigParser().get('bitmessagesettings', 'maxdownloadrate')))
         self.ui.lineEditMaxUploadRate.setText(str(
-            shared.config.get('bitmessagesettings', 'maxuploadrate')))
+            BMConfigParser().get('bitmessagesettings', 'maxuploadrate')))
+        self.ui.lineEditMaxOutboundConnections.setText(str(
+            BMConfigParser().get('bitmessagesettings', 'maxoutboundconnections')))
 
         # Demanded difficulty tab
-        self.ui.lineEditTotalDifficulty.setText(str((float(shared.config.getint(
-            'bitmessagesettings', 'defaultnoncetrialsperbyte')) / shared.networkDefaultProofOfWorkNonceTrialsPerByte)))
-        self.ui.lineEditSmallMessageDifficulty.setText(str((float(shared.config.getint(
-            'bitmessagesettings', 'defaultpayloadlengthextrabytes')) / shared.networkDefaultPayloadLengthExtraBytes)))
+        self.ui.lineEditTotalDifficulty.setText(str((float(BMConfigParser().getint(
+            'bitmessagesettings', 'defaultnoncetrialsperbyte')) / defaults.networkDefaultProofOfWorkNonceTrialsPerByte)))
+        self.ui.lineEditSmallMessageDifficulty.setText(str((float(BMConfigParser().getint(
+            'bitmessagesettings', 'defaultpayloadlengthextrabytes')) / defaults.networkDefaultPayloadLengthExtraBytes)))
 
         # Max acceptable difficulty tab
-        self.ui.lineEditMaxAcceptableTotalDifficulty.setText(str((float(shared.config.getint(
-            'bitmessagesettings', 'maxacceptablenoncetrialsperbyte')) / shared.networkDefaultProofOfWorkNonceTrialsPerByte)))
-        self.ui.lineEditMaxAcceptableSmallMessageDifficulty.setText(str((float(shared.config.getint(
-            'bitmessagesettings', 'maxacceptablepayloadlengthextrabytes')) / shared.networkDefaultPayloadLengthExtraBytes)))
+        self.ui.lineEditMaxAcceptableTotalDifficulty.setText(str((float(BMConfigParser().getint(
+            'bitmessagesettings', 'maxacceptablenoncetrialsperbyte')) / defaults.networkDefaultProofOfWorkNonceTrialsPerByte)))
+        self.ui.lineEditMaxAcceptableSmallMessageDifficulty.setText(str((float(BMConfigParser().getint(
+            'bitmessagesettings', 'maxacceptablepayloadlengthextrabytes')) / defaults.networkDefaultPayloadLengthExtraBytes)))
 
         # OpenCL
         if openclpow.openclAvailable():
@@ -4091,20 +4152,20 @@ class settingsDialog(QtGui.QDialog):
         self.ui.comboBoxOpenCL.addItems(openclpow.vendors)
         self.ui.comboBoxOpenCL.setCurrentIndex(0)
         for i in range(self.ui.comboBoxOpenCL.count()):
-            if self.ui.comboBoxOpenCL.itemText(i) == shared.safeConfigGet('bitmessagesettings', 'opencl'):
+            if self.ui.comboBoxOpenCL.itemText(i) == BMConfigParser().safeGet('bitmessagesettings', 'opencl'):
                 self.ui.comboBoxOpenCL.setCurrentIndex(i)
                 break
 
         # Namecoin integration tab
-        nmctype = shared.config.get('bitmessagesettings', 'namecoinrpctype')
+        nmctype = BMConfigParser().get('bitmessagesettings', 'namecoinrpctype')
         self.ui.lineEditNamecoinHost.setText(str(
-            shared.config.get('bitmessagesettings', 'namecoinrpchost')))
+            BMConfigParser().get('bitmessagesettings', 'namecoinrpchost')))
         self.ui.lineEditNamecoinPort.setText(str(
-            shared.config.get('bitmessagesettings', 'namecoinrpcport')))
+            BMConfigParser().get('bitmessagesettings', 'namecoinrpcport')))
         self.ui.lineEditNamecoinUser.setText(str(
-            shared.config.get('bitmessagesettings', 'namecoinrpcuser')))
+            BMConfigParser().get('bitmessagesettings', 'namecoinrpcuser')))
         self.ui.lineEditNamecoinPassword.setText(str(
-            shared.config.get('bitmessagesettings', 'namecoinrpcpassword')))
+            BMConfigParser().get('bitmessagesettings', 'namecoinrpcpassword')))
 
         if nmctype == "namecoind":
             self.ui.radioButtonNamecoinNamecoind.setChecked(True)
@@ -4126,14 +4187,14 @@ class settingsDialog(QtGui.QDialog):
 
         #Message Resend tab
         self.ui.lineEditDays.setText(str(
-            shared.config.get('bitmessagesettings', 'stopresendingafterxdays')))
+            BMConfigParser().get('bitmessagesettings', 'stopresendingafterxdays')))
         self.ui.lineEditMonths.setText(str(
-            shared.config.get('bitmessagesettings', 'stopresendingafterxmonths')))
+            BMConfigParser().get('bitmessagesettings', 'stopresendingafterxmonths')))
         
         
         #'System' tab removed for now.
         """try:
-            maxCores = shared.config.getint('bitmessagesettings', 'maxcores')
+            maxCores = BMConfigParser().getint('bitmessagesettings', 'maxcores')
         except:
             maxCores = 99999
         if maxCores <= 1:
@@ -4159,7 +4220,6 @@ class settingsDialog(QtGui.QDialog):
             self.ui.lineEditSocksPassword.setEnabled(False)
             self.ui.checkBoxAuthentication.setEnabled(False)
             self.ui.checkBoxSocksListen.setEnabled(False)
-            self.ui.lineEditTCPPort.setEnabled(True)
         elif comboBoxIndex == 1 or comboBoxIndex == 2:
             self.ui.lineEditSocksHostname.setEnabled(True)
             self.ui.lineEditSocksPort.setEnabled(True)
@@ -4168,7 +4228,6 @@ class settingsDialog(QtGui.QDialog):
             if self.ui.checkBoxAuthentication.isChecked():
                 self.ui.lineEditSocksUsername.setEnabled(True)
                 self.ui.lineEditSocksPassword.setEnabled(True)
-            self.ui.lineEditTCPPort.setEnabled(False)
 
     # Check status of namecoin integration radio buttons and translate
     # it to a string as in the options.
@@ -4191,7 +4250,7 @@ class settingsDialog(QtGui.QDialog):
         self.ui.labelNamecoinPassword.setEnabled(isNamecoind)
 
         if isNamecoind:
-            self.ui.lineEditNamecoinPort.setText(shared.namecoinDefaultRpcPort)
+            self.ui.lineEditNamecoinPort.setText(defaults.namecoinDefaultRpcPort)
         else:
             self.ui.lineEditNamecoinPort.setText("9000")
 
@@ -4222,13 +4281,13 @@ class SpecialAddressBehaviorDialog(QtGui.QDialog):
         self.ui.setupUi(self)
         self.parent = parent
         addressAtCurrentRow = parent.getCurrentAccount()
-        if not shared.safeConfigGetBoolean(addressAtCurrentRow, 'chan'):
-            if shared.safeConfigGetBoolean(addressAtCurrentRow, 'mailinglist'):
+        if not BMConfigParser().safeGetBoolean(addressAtCurrentRow, 'chan'):
+            if BMConfigParser().safeGetBoolean(addressAtCurrentRow, 'mailinglist'):
                 self.ui.radioButtonBehaviorMailingList.click()
             else:
                 self.ui.radioButtonBehaveNormalAddress.click()
             try:
-                mailingListName = shared.config.get(
+                mailingListName = BMConfigParser().get(
                     addressAtCurrentRow, 'mailinglistname')
             except:
                 mailingListName = ''
@@ -4259,7 +4318,7 @@ class EmailGatewayDialog(QtGui.QDialog):
             self.ui.radioButtonStatus.setEnabled(False)
             self.ui.radioButtonSettings.setEnabled(False)
             self.ui.radioButtonUnregister.setEnabled(False)
-        label = shared.config.get(addressAtCurrentRow, 'label')
+        label = BMConfigParser().get(addressAtCurrentRow, 'label')
         if label.find("@mailchuck.com") > -1:
             self.ui.lineEditEmail.setText(label)
 
@@ -4364,7 +4423,7 @@ class iconGlossaryDialog(QtGui.QDialog):
         self.ui.setupUi(self)
         self.parent = parent
         self.ui.labelPortNumber.setText(_translate(
-            "MainWindow", "You are using TCP port %1. (This can be changed in the settings).").arg(str(shared.config.getint('bitmessagesettings', 'port'))))
+            "MainWindow", "You are using TCP port %1. (This can be changed in the settings).").arg(str(BMConfigParser().getint('bitmessagesettings', 'port'))))
         QtGui.QWidget.resize(self, QtGui.QWidget.sizeHint(self))
 
 
@@ -4415,7 +4474,7 @@ class MySingleApplication(QApplication):
 
         # Checks if there's an instance of the local server id running
         if self.is_running:
-            # This should be ignored, singleton.py will take care of exiting me.
+            # This should be ignored, singleinstance.py will take care of exiting me.
             pass
         else:
             # Nope, create a local server with this id and assign on_new_connection
@@ -4429,7 +4488,6 @@ class MySingleApplication(QApplication):
             self.server.close()
 
     def on_new_connection(self):
-        global myapp
         if myapp:
             myapp.appIndicatorShow()
 
@@ -4449,17 +4507,17 @@ def run():
     myapp.appIndicatorInit(app)
     myapp.ubuntuMessagingMenuInit()
     myapp.notifierInit()
-    if shared.safeConfigGetBoolean('bitmessagesettings', 'dontconnect'):
+    if BMConfigParser().safeGetBoolean('bitmessagesettings', 'dontconnect'):
         myapp.showConnectDialog() # ask the user if we may connect
     
 #    try:
-#        if shared.config.get('bitmessagesettings', 'mailchuck') < 1:
-#            myapp.showMigrationWizard(shared.config.get('bitmessagesettings', 'mailchuck'))
+#        if BMConfigParser().get('bitmessagesettings', 'mailchuck') < 1:
+#            myapp.showMigrationWizard(BMConfigParser().get('bitmessagesettings', 'mailchuck'))
 #    except:
 #        myapp.showMigrationWizard(0)
     
     # only show after wizards and connect dialogs have completed
-    if not shared.config.getboolean('bitmessagesettings', 'startintray'):
+    if not BMConfigParser().getboolean('bitmessagesettings', 'startintray'):
         myapp.show()
 
     sys.exit(app.exec_())

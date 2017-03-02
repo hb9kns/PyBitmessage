@@ -3,7 +3,7 @@ from os import path, listdir
 from string import lower
 
 from debug import logger
-
+import paths
 
 class MsgBase(object):
     def encode(self):
@@ -14,7 +14,7 @@ def constructObject(data):
     try:
         classBase = eval(data[""] + "." + data[""].title())
     except NameError:
-        print "Don't know how to handle message type: \"%s\"" % (data[""])
+        logger.error("Don't know how to handle message type: \"%s\"", data[""])
         return None
     try:
         returnObj = classBase()
@@ -28,15 +28,19 @@ def constructObject(data):
     else:
         return returnObj
 
-for mod in listdir(path.dirname(__file__)):
-    if mod == "__init__.py":
-        continue
-    splitted = path.splitext(mod)
-    if splitted[1] != ".py":
-        continue
-    try:
-        import_module("." + splitted[0], "messagetypes")
-    except ImportError:
-        logger.error("Error importing %s", mod, exc_info=True)
-    else:
-        logger.debug("Imported message type module %s", mod)
+if paths.frozen is not None:
+    import messagetypes.message
+    import messagetypes.vote
+else:
+    for mod in listdir(path.dirname(__file__)):
+        if mod == "__init__.py":
+            continue
+        splitted = path.splitext(mod)
+        if splitted[1] != ".py":
+            continue
+        try:
+            import_module("." + splitted[0], "messagetypes")
+        except ImportError:
+            logger.error("Error importing %s", mod, exc_info=True)
+        else:
+            logger.debug("Imported message type module %s", mod)

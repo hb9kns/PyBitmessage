@@ -13,8 +13,10 @@ SOURCES	= 	../addresses.py\
 			../helper_bootstrap.py\
 			../helper_generic.py\
 			../helper_inbox.py\
+			../helper_msgcoding.py\
 			../helper_sent.py\
 			../helper_startup.py\
+			../proofofwork.py\
 			../shared.py\
 			../upnp.py\
 			../bitmessageqt/__init__.py\
