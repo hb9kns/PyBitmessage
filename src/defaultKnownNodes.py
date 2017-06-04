@@ -11,7 +11,7 @@ def createDefaultKnownNodes(appdata):
     ############## Stream 1 ################
     stream1 = {}
 
-    #stream1[state.Peer('2604:2000:1380:9f:82e:148b:2746:d0c7', 8080)] = int(time.time())
+    #stream1[shared.Peer('2604:2000:1380:9f:82e:148b:2746:d0c7', 8080)] = int(time.time())
     # yargo.mdns.org:
     stream1[state.Peer('185.73.240.124', 8444)] = int(time.time())
     stream1[state.Peer('5.45.99.75', 8444)] = int(time.time())
