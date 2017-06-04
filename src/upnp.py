@@ -6,11 +6,14 @@ import socket
 from struct import unpack, pack
 import threading
 import time
+from bmconfigparser import BMConfigParser
 from helper_threading import *
+import queues
 import shared
+import state
 import tr
 
-def createRequestXML(service, action, arguments=[]):
+def createRequestXML(service, action, arguments=None):
     from xml.dom.minidom import Document
 
     doc = Document()
@@ -36,11 +39,12 @@ def createRequestXML(service, action, arguments=[]):
     # iterate over arguments, create nodes, create text nodes,
     # append text nodes to nodes, and finally add the ready product
     # to argument_list
-    for k, v in arguments:
-        tmp_node = doc.createElement(k)
-        tmp_text_node = doc.createTextNode(v)
-        tmp_node.appendChild(tmp_text_node)
-        argument_list.append(tmp_node)
+    if arguments is not None:
+        for k, v in arguments:
+            tmp_node = doc.createElement(k)
+            tmp_text_node = doc.createTextNode(v)
+            tmp_node.appendChild(tmp_text_node)
+            argument_list.append(tmp_node)
 
     # append the prepared argument nodes to the function element
     for arg in argument_list:
@@ -139,7 +143,7 @@ class Router:
         dom = parseString(resp)
         return dom.getElementsByTagName('NewExternalIPAddress')[0].childNodes[0].data
     
-    def soapRequest(self, service, action, arguments=[]):
+    def soapRequest(self, service, action, arguments=None):
         from xml.dom.minidom import parseString
         from debug import logger
         conn = httplib.HTTPConnection(self.routerPath.hostname, self.routerPath.port)
@@ -175,9 +179,9 @@ class uPnPThread(threading.Thread, StoppableThread):
 
     def __init__ (self):
         threading.Thread.__init__(self, name="uPnPThread")
-        self.localPort = shared.config.getint('bitmessagesettings', 'port')
+        self.localPort = BMConfigParser().getint('bitmessagesettings', 'port')
         try:
-            self.extPort = shared.config.getint('bitmessagesettings', 'extport')
+            self.extPort = BMConfigParser().getint('bitmessagesettings', 'extport')
         except:
             self.extPort = None
         self.localIP = self.getLocalIP()
@@ -195,7 +199,7 @@ class uPnPThread(threading.Thread, StoppableThread):
         logger.debug("Starting UPnP thread")
         logger.debug("Local IP: %s", self.localIP)
         lastSent = 0
-        while shared.shutdown == 0 and shared.safeConfigGetBoolean('bitmessagesettings', 'upnp'):
+        while state.shutdown == 0 and BMConfigParser().safeGetBoolean('bitmessagesettings', 'upnp'):
             if time.time() - lastSent > self.sendSleep and len(self.routers) == 0:
                 try:
                     self.sendSearchRouter()
@@ -203,7 +207,7 @@ class uPnPThread(threading.Thread, StoppableThread):
                     pass
                 lastSent = time.time()
             try:
-                while shared.shutdown == 0 and shared.safeConfigGetBoolean('bitmessagesettings', 'upnp'):
+                while state.shutdown == 0 and BMConfigParser().safeGetBoolean('bitmessagesettings', 'upnp'):
                     resp,(ip,port) = self.sock.recvfrom(1000)
                     if resp is None:
                         continue
@@ -215,7 +219,12 @@ class uPnPThread(threading.Thread, StoppableThread):
                         logger.debug("Found UPnP router at %s", ip)
                         self.routers.append(newRouter)
                         self.createPortMapping(newRouter)
-                        shared.UISignalQueue.put(('updateStatusBar', tr._translate("MainWindow",'UPnP port mapping established on port %1').arg(str(self.extPort))))
+                        queues.UISignalQueue.put(('updateStatusBar', tr._translate("MainWindow",'UPnP port mapping established on port %1').arg(str(self.extPort))))
+                        # retry connections so that the submitted port is refreshed
+                        with shared.alreadyAttemptedConnectionsListLock:
+                            shared.alreadyAttemptedConnectionsList.clear()
+                            shared.alreadyAttemptedConnectionsListResetTime = int(
+                                time.time())
                         break
             except socket.timeout as e:
                 pass
@@ -239,7 +248,7 @@ class uPnPThread(threading.Thread, StoppableThread):
                 self.deletePortMapping(router)
         shared.extPort = None
         if deleted:
-            shared.UISignalQueue.put(('updateStatusBar', tr._translate("MainWindow",'UPnP port mapping removed')))
+            queues.UISignalQueue.put(('updateStatusBar', tr._translate("MainWindow",'UPnP port mapping removed')))
         logger.debug("UPnP thread done")
 
     def getLocalIP(self):
@@ -279,7 +288,8 @@ class uPnPThread(threading.Thread, StoppableThread):
                 router.AddPortMapping(extPort, self.localPort, localIP, 'TCP', 'BitMessage')
                 shared.extPort = extPort
                 self.extPort = extPort
-                shared.config.set('bitmessagesettings', 'extport', str(extPort))
+                BMConfigParser().set('bitmessagesettings', 'extport', str(extPort))
+                BMConfigParser().save()
                 break
             except UPnPError:
                 logger.debug("UPnP error: ", exc_info=True)

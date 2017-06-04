@@ -21,11 +21,15 @@ import dialog
 from dialog import Dialog
 from helper_sql import *
 
-import shared
-import ConfigParser
 from addresses import *
-from pyelliptic.openssl import OpenSSL
+import ConfigParser
+from bmconfigparser import BMConfigParser
+from inventory import Inventory
 import l10n
+from pyelliptic.openssl import OpenSSL
+import queues
+import shared
+import shutdown
 
 quit = False
 menutab = 1
@@ -108,8 +112,8 @@ def scrollbox(d, text, height=None, width=None):
 
 def resetlookups():
     global inventorydata
-    inventorydata = shared.numberOfInventoryLookupsPerformed
-    shared.numberOfInventoryLookupsPerformed = 0
+    inventorydata = Inventory().numberOfInventoryLookupsPerformed
+    Inventory().numberOfInventoryLookupsPerformed = 0
     Timer(1, resetlookups, ()).start()
 def drawtab(stdscr):
     if menutab in range(1, len(menu)+1):
@@ -329,7 +333,6 @@ def handlech(c, stdscr):
                             sendMessage(fromaddr, toaddr, ischan, subject, body, True)
                             dialogreset(stdscr)
                         elif t == "4": # Add to Address Book
-                            global addrbook
                             addr = inbox[inboxcur][4]
                             if addr not in [item[1] for i,item in enumerate(addrbook)]:
                                 r, t = d.inputbox("Label for address \""+addr+"\"")
@@ -444,7 +447,7 @@ def handlech(c, stdscr):
                                             choices=[("1", "Spend time shortening the address", 1 if shorten else 0)])
                                         if r == d.DIALOG_OK and "1" in t:
                                             shorten = True
-                                        shared.addressGeneratorQueue.put(("createRandomAddress", 4, stream, label, 1, "", shorten))
+                                        queues.addressGeneratorQueue.put(("createRandomAddress", 4, stream, label, 1, "", shorten))
                                 elif t == "2":
                                     set_background_title(d, "Make deterministic addresses")
                                     r, t = d.passwordform("Enter passphrase",
@@ -467,7 +470,7 @@ def handlech(c, stdscr):
                                                 scrollbox(d, unicode("In addition to your passphrase, be sure to remember the following numbers:\n"
                                                     "\n  * Address version number: "+str(4)+"\n"
                                                     "  * Stream number: "+str(stream)))
-                                                shared.addressGeneratorQueue.put(('createDeterministicAddresses', 4, stream, "unused deterministic address", number, str(passphrase), shorten))
+                                                queues.addressGeneratorQueue.put(('createDeterministicAddresses', 4, stream, "unused deterministic address", number, str(passphrase), shorten))
                                         else:
                                             scrollbox(d, unicode("Passphrases do not match"))
                         elif t == "2": # Send a message
@@ -481,19 +484,19 @@ def handlech(c, stdscr):
                             r, t = d.inputbox("New address label", init=label)
                             if r == d.DIALOG_OK:
                                 label = t
-                                shared.config.set(a, "label", label)
+                                BMConfigParser().set(a, "label", label)
                                 # Write config
-                                shared.writeKeysFile()
+                                BMConfigParser().save()
                                 addresses[addrcur][0] = label
                         elif t == "4": # Enable address
                             a = addresses[addrcur][2]
-                            shared.config.set(a, "enabled", "true") # Set config
+                            BMConfigParser().set(a, "enabled", "true") # Set config
                             # Write config
-                            shared.writeKeysFile()
+                            BMConfigParser().save()
                             # Change color
-                            if shared.safeConfigGetBoolean(a, 'chan'):
+                            if BMConfigParser().safeGetBoolean(a, 'chan'):
                                 addresses[addrcur][3] = 9 # orange
-                            elif shared.safeConfigGetBoolean(a, 'mailinglist'):
+                            elif BMConfigParser().safeGetBoolean(a, 'mailinglist'):
                                 addresses[addrcur][3] = 5 # magenta
                             else:
                                 addresses[addrcur][3] = 0 # black
@@ -501,48 +504,48 @@ def handlech(c, stdscr):
                             shared.reloadMyAddressHashes() # Reload address hashes
                         elif t == "5": # Disable address
                             a = addresses[addrcur][2]
-                            shared.config.set(a, "enabled", "false") # Set config
+                            BMConfigParser().set(a, "enabled", "false") # Set config
                             addresses[addrcur][3] = 8 # Set color to gray
                             # Write config
-                            shared.writeKeysFile()
+                            BMConfigParser().save()
                             addresses[addrcur][1] = False
                             shared.reloadMyAddressHashes() # Reload address hashes
                         elif t == "6": # Delete address
                             r, t = d.inputbox("Type in \"I want to delete this address\"", width=50)
                             if r == d.DIALOG_OK and t == "I want to delete this address":
-                                    shared.config.remove_section(addresses[addrcur][2])
-                                    shared.writeKeysFile()
+                                    BMConfigParser().remove_section(addresses[addrcur][2])
+                                    BMConfigParser().save()
                                     del addresses[addrcur]
                         elif t == "7": # Special address behavior
                             a = addresses[addrcur][2]
                             set_background_title(d, "Special address behavior")
-                            if shared.safeConfigGetBoolean(a, "chan"):
+                            if BMConfigParser().safeGetBoolean(a, "chan"):
                                 scrollbox(d, unicode("This is a chan address. You cannot use it as a pseudo-mailing list."))
                             else:
-                                m = shared.safeConfigGetBoolean(a, "mailinglist")
+                                m = BMConfigParser().safeGetBoolean(a, "mailinglist")
                                 r, t = d.radiolist("Select address behavior",
                                     choices=[("1", "Behave as a normal address", not m),
                                         ("2", "Behave as a pseudo-mailing-list address", m)])
                                 if r == d.DIALOG_OK:
                                     if t == "1" and m == True:
-                                        shared.config.set(a, "mailinglist", "false")
+                                        BMConfigParser().set(a, "mailinglist", "false")
                                         if addresses[addrcur][1]:
                                             addresses[addrcur][3] = 0 # Set color to black
                                         else:
                                             addresses[addrcur][3] = 8 # Set color to gray
                                     elif t == "2" and m == False:
                                         try:
-                                            mn = shared.config.get(a, "mailinglistname")
+                                            mn = BMConfigParser().get(a, "mailinglistname")
                                         except ConfigParser.NoOptionError:
                                            mn = ""
                                         r, t = d.inputbox("Mailing list name", init=mn)
                                         if r == d.DIALOG_OK:
                                             mn = t
-                                            shared.config.set(a, "mailinglist", "true")
-                                            shared.config.set(a, "mailinglistname", mn)
+                                            BMConfigParser().set(a, "mailinglist", "true")
+                                            BMConfigParser().set(a, "mailinglistname", mn)
                                             addresses[addrcur][3] = 6 # Set color to magenta
                                     # Write config
-                                    shared.writeKeysFile()
+                                    BMConfigParser().save()
                 elif menutab == 5:
                     set_background_title(d, "Subscriptions Dialog Box")
                     if len(subscriptions) <= subcur:
@@ -568,7 +571,7 @@ def handlech(c, stdscr):
                                         subscriptions.append([label, addr, True])
                                         subscriptions.reverse()
 
-                                        sqlExecute("INSERT INTO subscriptions VALUES (?,?,?)", label, address, True)
+                                        sqlExecute("INSERT INTO subscriptions VALUES (?,?,?)", label, addr, True)
                                         shared.reloadBroadcastSendersForWhichImWatching()
                         elif t == "2":
                             r, t = d.inpuxbox("Type in \"I want to delete this subscription\"")
@@ -607,7 +610,7 @@ def handlech(c, stdscr):
                                 subscriptions.append([label, addr, True])
                                 subscriptions.reverse()
 
-                                sqlExecute("INSERT INTO subscriptions VALUES (?,?,?)", label, address, True)
+                                sqlExecute("INSERT INTO subscriptions VALUES (?,?,?)", label, addr, True)
                                 shared.reloadBroadcastSendersForWhichImWatching()
                         elif t == "3":
                             r, t = d.inputbox("Input new address")
@@ -792,8 +795,8 @@ def sendMessage(sender="", recv="", broadcast=None, subject="", body="", reply=F
                         0, # retryNumber
                         "sent",
                         2, # encodingType
-                        shared.config.getint('bitmessagesettings', 'ttl'))
-                    shared.workerQueue.put(("sendmessage", addr))
+                        BMConfigParser().getint('bitmessagesettings', 'ttl'))
+                    queues.workerQueue.put(("sendmessage", addr))
     else: # Broadcast
         if recv == "":
             set_background_title(d, "Empty sender error")
@@ -818,8 +821,8 @@ def sendMessage(sender="", recv="", broadcast=None, subject="", body="", reply=F
                 0, # retryNumber
                 "sent", # folder
                 2, # encodingType
-                shared.config.getint('bitmessagesettings', 'ttl'))
-            shared.workerQueue.put(('sendbroadcast', ''))
+                BMConfigParser().getint('bitmessagesettings', 'ttl'))
+            queues.workerQueue.put(('sendbroadcast', ''))
 
 def loadInbox():
     sys.stdout = sys.__stdout__
@@ -832,7 +835,6 @@ def loadInbox():
         FROM inbox WHERE folder='inbox' AND %s LIKE ?
         ORDER BY received
         """ % (where,), what)
-    global inbox
     for row in ret:
         msgid, toaddr, fromaddr, subject, received, read = row
         subject = ascii(shared.fixPotentiallyInvalidUTF8Data(subject))
@@ -842,7 +844,7 @@ def loadInbox():
             if toaddr == BROADCAST_STR:
                 tolabel = BROADCAST_STR
             else:
-                tolabel = shared.config.get(toaddr, "label")
+                tolabel = BMConfigParser().get(toaddr, "label")
         except:
             tolabel = ""
         if tolabel == "":
@@ -851,8 +853,8 @@ def loadInbox():
         
         # Set label for from address
         fromlabel = ""
-        if shared.config.has_section(fromaddr):
-            fromlabel = shared.config.get(fromaddr, "label")
+        if BMConfigParser().has_section(fromaddr):
+            fromlabel = BMConfigParser().get(fromaddr, "label")
         if fromlabel == "": # Check Address Book
             qr = sqlQuery("SELECT label FROM addressbook WHERE address=?", fromaddr)
             if qr != []:
@@ -882,7 +884,6 @@ def loadSent():
         FROM sent WHERE folder='sent' AND %s LIKE ?
         ORDER BY lastactiontime
         """ % (where,), what)
-    global sent
     for row in ret:
         toaddr, fromaddr, subject, status, ackdata, lastactiontime = row
         subject = ascii(shared.fixPotentiallyInvalidUTF8Data(subject))
@@ -899,15 +900,15 @@ def loadSent():
                 for r in qr:
                     tolabel, = r
         if tolabel == "":
-            if shared.config.has_section(toaddr):
-                tolabel = shared.config.get(toaddr, "label")
+            if BMConfigParser().has_section(toaddr):
+                tolabel = BMConfigParser().get(toaddr, "label")
         if tolabel == "":
             tolabel = toaddr
         
         # Set label for from address
         fromlabel = ""
-        if shared.config.has_section(fromaddr):
-            fromlabel = shared.config.get(fromaddr, "label")
+        if BMConfigParser().has_section(fromaddr):
+            fromlabel = BMConfigParser().get(fromaddr, "label")
         if fromlabel == "":
             fromlabel = fromaddr
         
@@ -954,7 +955,6 @@ def loadAddrBook():
     sys.stdout = printlog
     
     ret = sqlQuery("SELECT label, address FROM addressbook")
-    global addrbook
     for row in ret:
         label, addr = row
         label = shared.fixPotentiallyInvalidUTF8Data(label)
@@ -968,7 +968,7 @@ def loadSubscriptions():
     subscriptions.reverse()
 def loadBlackWhiteList():
     global bwtype
-    bwtype = shared.config.get("bitmessagesettings", "blackwhitelist")
+    bwtype = BMConfigParser().get("bitmessagesettings", "blackwhitelist")
     if bwtype == "black":
         ret = sqlQuery("SELECT label, address, enabled FROM blacklist")
     else:
@@ -999,7 +999,7 @@ def runwrapper():
     stdscr.timeout(1000)
     
     curses.wrapper(run)
-    shutdown()
+    doShutdown()
 
 def run(stdscr):
     # Schedule inventory lookup data
@@ -1024,17 +1024,17 @@ def run(stdscr):
             curses.init_pair(9, curses.COLOR_YELLOW, curses.COLOR_BLACK) # orangish
     
     # Init list of address in 'Your Identities' tab
-    configSections = shared.config.sections()
+    configSections = BMConfigParser().sections()
     for addressInKeysFile in configSections:
         if addressInKeysFile != "bitmessagesettings":
-            isEnabled = shared.config.getboolean(addressInKeysFile, "enabled")
-            addresses.append([shared.config.get(addressInKeysFile, "label"), isEnabled, addressInKeysFile])
+            isEnabled = BMConfigParser().getboolean(addressInKeysFile, "enabled")
+            addresses.append([BMConfigParser().get(addressInKeysFile, "label"), isEnabled, addressInKeysFile])
             # Set address color
             if not isEnabled:
                 addresses[len(addresses)-1].append(8) # gray
-            elif shared.safeConfigGetBoolean(addressInKeysFile, 'chan'):
+            elif BMConfigParser().safeGetBoolean(addressInKeysFile, 'chan'):
                 addresses[len(addresses)-1].append(9) # orange
-            elif shared.safeConfigGetBoolean(addressInKeysFile, 'mailinglist'):
+            elif BMConfigParser().safeGetBoolean(addressInKeysFile, 'mailinglist'):
                 addresses[len(addresses)-1].append(5) # magenta
             else:
                 addresses[len(addresses)-1].append(0) # black
@@ -1046,11 +1046,11 @@ def run(stdscr):
         drawtab(stdscr)
         handlech(stdscr.getch(), stdscr)
 
-def shutdown():
+def doShutdown():
     sys.stdout = sys.__stdout__
     print("Shutting down...")
     sys.stdout = printlog
-    shared.doCleanShutdown()
+    shutdown.doCleanShutdown()
     sys.stdout = sys.__stdout__
     sys.stderr = sys.__stderr__
     
